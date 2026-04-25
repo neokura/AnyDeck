@@ -795,7 +795,7 @@ eDP-1 connected primary 1920x1080+0+0
                 "main.RGB_LED_PATH_GLOBS", [os.path.join(tmpdir, "*:rgb:*")]
             ):
                 state = asyncio.run(plugin.get_rgb_state())
-                success = asyncio.run(plugin.set_rgb_color("#00FF85"))
+                success = asyncio.run(plugin.set_rgb_color("#00FF00"))
 
             with open(os.path.join(led, "multi_intensity"), "r") as f:
                 values = f.read()
@@ -804,7 +804,7 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertTrue(state["enabled"])
         self.assertEqual(state["color"], "#00B7FF")
         self.assertTrue(success)
-        self.assertEqual(values, "0 255 133")
+        self.assertEqual(values, "0 255 0")
 
     def test_rgb_legacy_packed_led_format_still_works_for_ally(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -823,7 +823,7 @@ eDP-1 connected primary 1920x1080+0+0
                 "main.RGB_LED_PATH_GLOBS", []
             ):
                 state = asyncio.run(plugin.get_rgb_state())
-                success = asyncio.run(plugin.set_rgb_color("#00FF85"))
+                success = asyncio.run(plugin.set_rgb_color("#00FF00"))
 
             with open(os.path.join(led, "multi_intensity"), "r") as f:
                 values = f.read()
@@ -831,12 +831,12 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertTrue(state["available"])
         self.assertEqual(state["color"], "#00B7FF")
         self.assertTrue(success)
-        self.assertEqual(values, "65413 65413 65413 65413")
+        self.assertEqual(values, "65280 65280 65280 65280")
 
     def test_legion_go_s_hid_rgb_uses_huesync_device_ids(self):
         plugin = main.Plugin()
         plugin.settings_path = None
-        plugin.settings = {"rgb_enabled": True, "rgb_color": "#00B7FF"}
+        plugin.settings = {"rgb_enabled": True, "rgb_color": "#00FFFF"}
         FakeHidDevice.writes = []
         FakeHidModule.devices = [
             {
@@ -857,19 +857,19 @@ eDP-1 connected primary 1920x1080+0+0
             plugin, "_hidraw_devices", return_value=[]
         ):
             state = asyncio.run(plugin.get_rgb_state())
-            success = asyncio.run(plugin.set_rgb_color("#00FF85"))
+            success = asyncio.run(plugin.set_rgb_color("#00FF00"))
 
         self.assertTrue(state["available"])
         self.assertIn("Legion Go S", state["details"])
         self.assertTrue(success)
         self.assertEqual(FakeHidDevice.writes[0], bytes([0x04, 0x06, 0x01]))
         self.assertEqual(FakeHidDevice.writes[1], bytes([0x10, 0x02, 0x03]))
-        self.assertEqual(FakeHidDevice.writes[2], bytes([0x10, 0x05, 0x00, 0x00, 0xFF, 0x85, 0x3F, 0x3F]))
+        self.assertEqual(FakeHidDevice.writes[2], bytes([0x10, 0x05, 0x00, 0x00, 0xFF, 0x00, 0x3F, 0x3F]))
 
     def test_legion_go_tablet_hid_rgb_uses_huesync_device_ids(self):
         plugin = main.Plugin()
         plugin.settings_path = None
-        plugin.settings = {"rgb_enabled": True, "rgb_color": "#00B7FF"}
+        plugin.settings = {"rgb_enabled": True, "rgb_color": "#00FFFF"}
         FakeHidDevice.writes = []
         FakeHidModule.devices = [
             {
@@ -900,7 +900,7 @@ eDP-1 connected primary 1920x1080+0+0
 
     def test_rgb_state_is_exposed_in_dashboard(self):
         plugin = main.Plugin()
-        plugin.settings = {"rgb_enabled": True, "rgb_color": "#00B7FF", "fps_limit": 0}
+        plugin.settings = {"rgb_enabled": True, "rgb_color": "#00FFFF", "fps_limit": 0}
 
         with patch.object(
             plugin,
@@ -932,7 +932,7 @@ eDP-1 connected primary 1920x1080+0+0
             return_value={
                 "available": True,
                 "enabled": True,
-                "color": "#00B7FF",
+                "color": "#00FFFF",
                 "presets": main.RGB_COLOR_PRESETS,
                 "details": "rgb",
             },
@@ -940,7 +940,7 @@ eDP-1 connected primary 1920x1080+0+0
             state = asyncio.run(plugin.get_dashboard_state())
 
         self.assertTrue(state["rgb"]["available"])
-        self.assertEqual(state["rgb"]["color"], "#00B7FF")
+        self.assertEqual(state["rgb"]["color"], "#00FFFF")
 
 
 class OptimizationStateTest(unittest.TestCase):

@@ -13,7 +13,26 @@ const { useEffect, useState } = window.SP_REACT;
 type VFC<P = {}> = (props: P) => JSX.Element | null;
 
 const PLUGIN_NAME = "Xbox Companion";
-const RGB_PRESETS = ["#FF0000", "#00B7FF", "#00FF85", "#FFFFFF"];
+const RGB_PRESETS = [
+  "#FF0000",
+  "#00FFFF",
+  "#8B00FF",
+  "#00FF00",
+  "#FF8000",
+  "#FF00FF",
+  "#FFFFFF",
+  "#0000FF",
+];
+const RGB_PRESET_LABELS: Record<string, string> = {
+  "#FF0000": "ROG Red",
+  "#00FFFF": "Cyan",
+  "#8B00FF": "Purple",
+  "#00FF00": "Green",
+  "#FF8000": "Orange",
+  "#FF00FF": "Pink",
+  "#FFFFFF": "White",
+  "#0000FF": "Blue",
+};
 
 const getDashboardState = callable<[], DashboardState>("get_dashboard_state");
 const getOptimizationStates = callable<[], OptimizationData>(
@@ -187,7 +206,7 @@ interface InformationState {
   fps_limit: FpsLimitState;
 }
 
-type ViewName = "dashboard" | "optimizations" | "information";
+type ViewName = "dashboard" | "rgb" | "optimizations" | "information";
 
 const viewTitleStyle: React.CSSProperties = {
   fontSize: "18px",
@@ -233,9 +252,9 @@ const infoValueStyle: React.CSSProperties = {
   lineHeight: 1.4,
 };
 
-const colorPresetGridStyle: React.CSSProperties = {
+const rgbQuickSwatchGridStyle: React.CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+  gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
   gap: "8px",
   width: "100%",
 };
@@ -255,17 +274,52 @@ const fpsSliderMetaStyle: React.CSSProperties = {
   marginTop: "4px",
 };
 
-const presetButtonStyle = (active: boolean): React.CSSProperties => ({
+const rgbHeroStyle = (enabled: boolean, color: string): React.CSSProperties => ({
+  borderRadius: "8px",
+  padding: "14px",
+  border: "1px solid rgba(100, 116, 139, 0.35)",
+  background: enabled
+    ? `linear-gradient(135deg, ${color} 0%, rgba(15,23,42,0.96) 82%)`
+    : "linear-gradient(135deg, rgba(51,65,85,0.7), rgba(15,23,42,0.96))",
+  minHeight: "84px",
+  display: "flex",
+  flexDirection: "column",
+  justifyContent: "space-between",
+  gap: "10px",
+});
+
+const rgbSwatchStripStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "repeat(8, minmax(0, 1fr))",
+  gap: "6px",
+  marginTop: "10px",
+};
+
+const rgbPresetRailStyle = (colors: string[]): React.CSSProperties => ({
+  width: "100%",
+  height: "10px",
+  borderRadius: "999px",
+  background: `linear-gradient(90deg, ${colors.join(", ")})`,
+  border: "1px solid rgba(148, 163, 184, 0.28)",
+  marginTop: "-8px",
+});
+
+const rgbQuickSwatchButtonStyle = (
+  active: boolean,
+  color: string
+): React.CSSProperties => ({
+  appearance: "none",
+  width: "100%",
   borderRadius: "10px",
-  padding: "8px 6px",
-  textAlign: "center",
-  fontSize: "11px",
-  fontWeight: 700,
-  color: active ? "#0f172a" : "#ffffff",
-  background: active ? "#60a5fa" : "rgba(51, 65, 85, 0.85)",
+  padding: "0",
   border: active
-    ? "1px solid rgba(147, 197, 253, 0.8)"
-    : "1px solid rgba(100, 116, 139, 0.4)",
+    ? "2px solid rgba(255,255,255,0.95)"
+    : "1px solid rgba(148, 163, 184, 0.35)",
+  background: "rgba(15, 23, 42, 0.35)",
+  boxShadow: active ? `0 0 16px ${color}` : "none",
+  overflow: "hidden",
+  minHeight: "54px",
+  cursor: "pointer",
 });
 
 const modeButtonStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
@@ -415,6 +469,7 @@ const DashboardView: VFC<{
   error: string | null;
   busyKey: string | null;
   onRefresh: () => Promise<void>;
+  onOpenRgb: () => void;
   onOpenOptimizations: () => void;
   onOpenInformation: () => void;
 }> = ({
@@ -423,6 +478,7 @@ const DashboardView: VFC<{
   error,
   busyKey,
   onRefresh,
+  onOpenRgb,
   onOpenOptimizations,
   onOpenInformation,
 }) => {
@@ -521,24 +577,6 @@ const DashboardView: VFC<{
   useEffect(() => {
     setFpsPresetIndex(normalizedFpsPresetIndex);
   }, [normalizedFpsPresetIndex]);
-
-  const handleRgbToggle = async (enabled: boolean) => {
-    await runAction(
-      "rgb-toggle",
-      () => setRgbEnabled(enabled),
-      `RGB ${enabled ? "enabled" : "disabled"}`,
-      "Could not change RGB"
-    );
-  };
-
-  const handleRgbColor = async (color: string) => {
-    await runAction(
-      `rgb:${color}`,
-      () => setRgbColor(color),
-      `RGB color: ${color}`,
-      "Could not change the RGB color"
-    );
-  };
 
   if (!data) {
     return (
@@ -674,44 +712,6 @@ const DashboardView: VFC<{
         />
       </PanelSectionRow>
 
-      {data.rgb.available && (
-        <div>
-          <PanelSectionRow>
-            <ToggleField
-              label={`RGB: ${data.rgb.enabled ? "enabled" : "disabled"}`}
-              description={data.rgb.details}
-              checked={data.rgb.enabled}
-              disabled={!data.rgb.available || controlsDisabled}
-              onChange={handleRgbToggle}
-            />
-          </PanelSectionRow>
-          {data.rgb.enabled && (
-            <PanelSectionRow>
-              <div style={colorPresetGridStyle}>
-                {(data.rgb.presets?.length ? data.rgb.presets : RGB_PRESETS).map((color) => (
-                  <ButtonItem
-                    key={color}
-                    layout="below"
-                    disabled={!data.rgb.available || controlsDisabled}
-                    onClick={() => handleRgbColor(color)}
-                  >
-                    <div
-                      style={{
-                        ...presetButtonStyle(data.rgb.color === color),
-                        background: color,
-                        color: color === "#FFFFFF" ? "#0f172a" : "#ffffff",
-                      }}
-                    >
-                      {color.replace("#", "")}
-                    </div>
-                  </ButtonItem>
-                ))}
-              </div>
-            </PanelSectionRow>
-          )}
-        </div>
-      )}
-
       <PanelSectionRow>
         <ToggleField
           label={`VRR: ${formatDisplayStatus(data.vrr).toLowerCase()}`}
@@ -786,6 +786,11 @@ const DashboardView: VFC<{
         />
       </PanelSectionRow>
 
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={onOpenRgb}>
+          RGB
+        </ButtonItem>
+      </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem layout="below" onClick={onOpenOptimizations}>
           Optimizations
@@ -936,6 +941,260 @@ const OptimizationsView: VFC<{
             </PanelSectionRow>
           ))}
         </PanelSection>
+      )}
+    </div>
+  );
+};
+
+const RGBView: VFC<{
+  data: DashboardState | null;
+  loading: boolean;
+  error: string | null;
+  busyKey: string | null;
+  onBack: () => void;
+  onRefresh: () => Promise<void>;
+}> = ({ data, loading, error, busyKey, onBack, onRefresh }) => {
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const controlsDisabled = busyKey !== null || actionBusy !== null;
+  const rgb = data?.rgb;
+  const rgbPresets = rgb?.presets?.length ? rgb.presets : RGB_PRESETS;
+  const normalizedPresetColor = rgbPresets.includes(rgb?.color ?? "")
+    ? rgb?.color ?? rgbPresets[0]
+    : rgbPresets[0];
+  const normalizedPresetIndex = Math.max(0, rgbPresets.indexOf(normalizedPresetColor));
+  const [presetIndex, setPresetIndex] = useState<number>(normalizedPresetIndex);
+  const activeColor = rgbPresets[presetIndex] ?? normalizedPresetColor;
+
+  useEffect(() => {
+    setPresetIndex(normalizedPresetIndex);
+  }, [normalizedPresetIndex]);
+
+  const runAction = async (
+    actionKey: string,
+    operation: () => Promise<boolean>,
+    successMessage: string,
+    failureMessage: string
+  ) => {
+    if (controlsDisabled) {
+      return;
+    }
+
+    setActionBusy(actionKey);
+    let success = false;
+    try {
+      success = await operation();
+      toaster.toast({
+        title: PLUGIN_NAME,
+        body: success ? successMessage : failureMessage,
+      });
+      await onRefresh();
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const handleRgbToggle = async (enabled: boolean) => {
+    await runAction(
+      "rgb-toggle",
+      () => setRgbEnabled(enabled),
+      `RGB ${enabled ? "enabled" : "disabled"}`,
+      "Could not change RGB"
+    );
+  };
+
+  const handleRgbColor = async (color: string) => {
+    await runAction(
+      `rgb:${color}`,
+      () => setRgbColor(color),
+      `RGB color: ${RGB_PRESET_LABELS[color] || color}`,
+      "Could not change the RGB color"
+    );
+  };
+
+  return (
+    <div>
+      <ViewHeader
+        title="RGB"
+        subtitle="Dedicated lighting controls with a cleaner preset workflow."
+        onBack={onBack}
+      />
+      {!data || !rgb ? (
+        <PanelSection>
+          <PanelSectionRow>
+            <div style={{ ...cardStyle, ...subtextStyle }}>
+              {loading ? "Loading RGB controls..." : "RGB controls are unavailable right now."}
+            </div>
+          </PanelSectionRow>
+          {error && (
+            <PanelSectionRow>
+              <StatusCard title="Refresh Failed" message={error} tone="error" />
+            </PanelSectionRow>
+          )}
+          {!loading && (
+            <PanelSectionRow>
+              <ButtonItem layout="below" onClick={() => void onRefresh()}>
+                Retry
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
+        </PanelSection>
+      ) : (
+        <div>
+          {error && (
+            <PanelSection>
+              <PanelSectionRow>
+                <StatusCard title="Last Refresh Failed" message={error} tone="error" />
+              </PanelSectionRow>
+            </PanelSection>
+          )}
+
+          <PanelSection title="RGB">
+            <PanelSectionRow>
+              <div style={cardStyle}>
+                <div style={rgbHeroStyle(rgb.enabled, activeColor)}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: "12px" }}>
+                    <div>
+                      <div style={{ color: "#ffffff", fontSize: "15px", fontWeight: 700 }}>
+                        {rgb.enabled ? "Lighting Enabled" : "Lighting Disabled"}
+                      </div>
+                      <div style={{ ...subtextStyle, color: "rgba(255,255,255,0.8)" }}>
+                        {rgb.details}
+                      </div>
+                    </div>
+                    <div
+                      style={{
+                        color: rgb.enabled ? "#ffffff" : "#cbd5e1",
+                        fontSize: "12px",
+                        fontWeight: 700,
+                        textAlign: "right",
+                      }}
+                    >
+                      {RGB_PRESET_LABELS[activeColor] || activeColor}
+                    </div>
+                  </div>
+
+                  <div style={rgbSwatchStripStyle}>
+                    {rgbPresets.map((color) => (
+                      <div
+                        key={color}
+                        style={{
+                          height: "18px",
+                          borderRadius: "999px",
+                          background: color,
+                          border:
+                            color === activeColor
+                              ? "2px solid rgba(255,255,255,0.95)"
+                              : "1px solid rgba(255,255,255,0.28)",
+                          boxShadow:
+                            rgb.enabled && color === activeColor
+                              ? `0 0 18px ${color}`
+                              : "none",
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <ToggleField
+                label={`RGB: ${rgb.enabled ? "enabled" : "disabled"}`}
+                description={rgb.details}
+                checked={rgb.enabled}
+                disabled={!rgb.available || controlsDisabled}
+                onChange={handleRgbToggle}
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <SliderField
+                label={`Color: ${RGB_PRESET_LABELS[activeColor] || activeColor}`}
+                description={
+                  rgb.available
+                    ? rgb.enabled
+                      ? "Horizontal preset selector"
+                      : "Choose the next color before enabling RGB"
+                    : rgb.details
+                }
+                value={presetIndex}
+                min={0}
+                max={Math.max(0, rgbPresets.length - 1)}
+                step={1}
+                disabled={!rgb.available || controlsDisabled}
+                showValue={false}
+                notchCount={rgbPresets.length}
+                notchTicksVisible
+                validValues="steps"
+                notchLabels={rgbPresets.map((_color, notchIndex) => ({
+                  notchIndex,
+                  label: "",
+                  value: notchIndex,
+                }))}
+                onChange={(value: number) => {
+                  const nextIndex = Math.max(0, Math.min(rgbPresets.length - 1, value));
+                  const nextColor = rgbPresets[nextIndex];
+                  if (!nextColor || nextIndex === presetIndex) {
+                    return;
+                  }
+                  setPresetIndex(nextIndex);
+                  void handleRgbColor(nextColor);
+                }}
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <div style={cardStyle}>
+                <div style={viewTitleStyle}>Palette</div>
+                <div style={subtextStyle}>
+                  A cleaner preset flow inspired by Ally Center, adapted to the RGB backend
+                  this plugin actually exposes.
+                </div>
+                <div style={rgbPresetRailStyle(rgbPresets)} />
+                <div style={rgbQuickSwatchGridStyle}>
+                  {rgbPresets.map((color) => {
+                    const active = activeColor === color;
+                    return (
+                      <button
+                        key={color}
+                        type="button"
+                        disabled={!rgb.available || controlsDisabled}
+                        style={{
+                          ...rgbQuickSwatchButtonStyle(active, color),
+                          opacity: !rgb.available || controlsDisabled ? 0.45 : 1,
+                        }}
+                        onClick={() => {
+                          setPresetIndex(rgbPresets.indexOf(color));
+                          void handleRgbColor(color);
+                        }}
+                      >
+                        <div
+                          style={{
+                            height: "24px",
+                            background: color,
+                            borderBottom: "1px solid rgba(255,255,255,0.12)",
+                          }}
+                        />
+                        <div
+                          style={{
+                            padding: "7px 6px 8px",
+                            fontSize: "10px",
+                            fontWeight: 700,
+                            color: active ? "#ffffff" : "#cbd5e1",
+                            textAlign: "center",
+                            lineHeight: 1.2,
+                          }}
+                        >
+                          {RGB_PRESET_LABELS[color] || color.replace("#", "")}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </PanelSectionRow>
+          </PanelSection>
+        </div>
       )}
     </div>
   );
@@ -1213,12 +1472,15 @@ const XboxCompanionContent: VFC = () => {
   };
 
   useEffect(() => {
-    if (view === "dashboard") {
+    if (view === "dashboard" || view === "rgb") {
       void refreshDashboard();
-      const interval = setInterval(() => {
-        void refreshDashboard({ silent: true });
-      }, 5000);
-      return () => clearInterval(interval);
+      if (view === "dashboard") {
+        const interval = setInterval(() => {
+          void refreshDashboard({ silent: true });
+        }, 5000);
+        return () => clearInterval(interval);
+      }
+      return;
     }
 
     if (view === "optimizations") {
@@ -1242,6 +1504,19 @@ const XboxCompanionContent: VFC = () => {
     );
   }
 
+  if (view === "rgb") {
+    return (
+      <RGBView
+        data={dashboard}
+        loading={loading}
+        error={dashboardError}
+        busyKey={busyKey}
+        onBack={() => setView("dashboard")}
+        onRefresh={refreshDashboard}
+      />
+    );
+  }
+
   if (view === "information") {
     return (
       <InformationView
@@ -1261,6 +1536,10 @@ const XboxCompanionContent: VFC = () => {
       error={dashboardError}
       busyKey={busyKey}
       onRefresh={refreshDashboard}
+      onOpenRgb={() => {
+        setLoading(true);
+        setView("rgb");
+      }}
       onOpenOptimizations={() => {
         setLoading(true);
         setView("optimizations");
