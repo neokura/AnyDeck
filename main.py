@@ -116,6 +116,9 @@ RGB_COLOR_PRESETS = [
 RGB_DEFAULT_BRIGHTNESS = 100
 LEGION_RGB_BRIGHTNESS_MAX = 63
 LEGION_RGB_SPEED_DEFAULT = 63
+RGB_DEFAULT_MODE = "solid"
+RGB_SPEED_OPTIONS = ("low", "medium", "high")
+RGB_DEFAULT_SPEED = "medium"
 DEFAULT_COMMAND_TIMEOUT = 5
 SYSTEM_COMMAND_ENV_DROP_KEYS = {
     "LD_LIBRARY_PATH",
@@ -892,6 +895,37 @@ class Plugin:
             self.settings.get("rgb_brightness", RGB_DEFAULT_BRIGHTNESS)
         )
 
+    def _normalize_rgb_speed(self, speed: str | None) -> str:
+        if not isinstance(speed, str):
+            return RGB_DEFAULT_SPEED
+        normalized = speed.strip().lower()
+        return normalized if normalized in RGB_SPEED_OPTIONS else RGB_DEFAULT_SPEED
+
+    def _get_rgb_supported_modes(self, backend: dict) -> list[str]:
+        if backend["type"] == "legion_hid":
+            return ["solid", "pulse", "rainbow"]
+        if backend["type"] == "sysfs":
+            return ["solid"]
+        return []
+
+    def _get_rgb_mode_capabilities(self, backend: dict) -> dict[str, dict]:
+        supported_modes = self._get_rgb_supported_modes(backend)
+        capabilities = {}
+        for mode in supported_modes:
+            capabilities[mode] = {
+                "color": mode in {"solid", "pulse"},
+                "brightness": True,
+                "speed": backend["type"] == "legion_hid" and mode in {"pulse", "rainbow"},
+            }
+        return capabilities
+
+    def _get_saved_rgb_mode(self, backend: dict) -> str:
+        supported_modes = self._get_rgb_supported_modes(backend)
+        if not supported_modes:
+            return RGB_DEFAULT_MODE
+        mode = str(self.settings.get("rgb_mode", supported_modes[0]) or supported_modes[0]).strip().lower()
+        return mode if mode in supported_modes else supported_modes[0]
+
     def _scale_rgb_brightness_to_raw(self, brightness: int, maximum: int) -> int:
         if maximum <= 0:
             return 0
@@ -1464,12 +1498,24 @@ class Plugin:
         color: str,
         enabled: bool,
         brightness: int = RGB_DEFAULT_BRIGHTNESS,
+        mode: str = RGB_DEFAULT_MODE,
+        speed: str = RGB_DEFAULT_SPEED,
     ) -> list[bytes]:
         if not enabled:
             return [bytes([0x04, 0x06, 0x00])]
 
         r, g, b = self._hex_to_rgb(color)
         profile = 3
+        mode_map = {
+            "solid": 0,
+            "pulse": 1,
+            "rainbow": 2,
+        }
+        speed_map = {
+            "low": 21,
+            "medium": 42,
+            "high": 63,
+        }
         raw_brightness = self._scale_rgb_brightness_to_raw(
             brightness,
             LEGION_RGB_BRIGHTNESS_MAX,
@@ -1477,7 +1523,16 @@ class Plugin:
         return [
             bytes([0x04, 0x06, 0x01]),
             bytes([0x10, 0x02, profile]),
-            bytes([0x10, profile + 2, 0x00, r, g, b, raw_brightness, LEGION_RGB_SPEED_DEFAULT]),
+            bytes([
+                0x10,
+                profile + 2,
+                mode_map.get(mode, 0),
+                r,
+                g,
+                b,
+                raw_brightness,
+                speed_map.get(speed, speed_map[RGB_DEFAULT_SPEED]),
+            ]),
         ]
 
     def _legion_go_tablet_rgb_commands(
@@ -1485,6 +1540,8 @@ class Plugin:
         color: str,
         enabled: bool,
         brightness: int = RGB_DEFAULT_BRIGHTNESS,
+        mode: str = RGB_DEFAULT_MODE,
+        speed: str = RGB_DEFAULT_SPEED,
     ) -> list[bytes]:
         def enable_command(controller: int, value: bool) -> bytes:
             return bytes([0x05, 0x06, 0x70, 0x02, controller, 0x01 if value else 0x00, 0x01])
@@ -1494,14 +1551,38 @@ class Plugin:
 
         r, g, b = self._hex_to_rgb(color)
         profile = 3
+        mode_map = {
+            "solid": 1,
+            "pulse": 2,
+            "rainbow": 3,
+        }
+        speed_map = {
+            "low": 42,
+            "medium": 21,
+            "high": 0,
+        }
         raw_brightness = self._scale_rgb_brightness_to_raw(
             brightness,
             LEGION_RGB_BRIGHTNESS_MAX,
         )
-        period = 0
+        period = speed_map.get(speed, speed_map[RGB_DEFAULT_SPEED])
         commands = []
         for controller in (0x03, 0x04):
-            commands.append(bytes([0x05, 0x0C, 0x72, 0x01, controller, 0x01, r, g, b, raw_brightness, period, profile, 0x01]))
+            commands.append(bytes([
+                0x05,
+                0x0C,
+                0x72,
+                0x01,
+                controller,
+                mode_map.get(mode, 1),
+                r,
+                g,
+                b,
+                raw_brightness,
+                period,
+                profile,
+                0x01,
+            ]))
         for controller in (0x03, 0x04):
             commands.append(bytes([0x05, 0x06, 0x73, 0x02, controller, profile, 0x01]))
         commands.extend([enable_command(0x03, True), enable_command(0x04, True)])
@@ -1517,12 +1598,14 @@ class Plugin:
         color: str,
         enabled: bool,
         brightness: int = RGB_DEFAULT_BRIGHTNESS,
+        mode: str = RGB_DEFAULT_MODE,
+        speed: str = RGB_DEFAULT_SPEED,
     ) -> list[bytes]:
         protocol = device["config"]["protocol"]
         if protocol == "legion_go_s":
-            return self._legion_go_s_rgb_commands(color, enabled, brightness)
+            return self._legion_go_s_rgb_commands(color, enabled, brightness, mode, speed)
         if protocol == "legion_go_tablet":
-            return self._legion_go_tablet_rgb_commands(color, enabled, brightness)
+            return self._legion_go_tablet_rgb_commands(color, enabled, brightness, mode, speed)
         return []
 
     def _open_hid_module_device(self, path):
@@ -1546,9 +1629,22 @@ class Plugin:
         color: str,
         enabled: bool,
         brightness: int | None = None,
+        mode: str | None = None,
+        speed: str | None = None,
     ) -> bool:
         target_brightness = self._get_saved_rgb_brightness() if brightness is None else brightness
-        commands = self._legion_hid_rgb_commands(device, color, enabled, target_brightness)
+        target_mode = self._get_saved_rgb_mode({"type": "legion_hid"}) if mode is None else mode
+        target_speed = self._normalize_rgb_speed(
+            self.settings.get("rgb_speed", RGB_DEFAULT_SPEED) if speed is None else speed
+        )
+        commands = self._legion_hid_rgb_commands(
+            device,
+            color,
+            enabled,
+            target_brightness,
+            target_mode,
+            target_speed,
+        )
         if not commands:
             return False
 
@@ -1586,42 +1682,60 @@ class Plugin:
                 "mode": "solid",
                 "color": RGB_COLOR_PRESETS[0],
                 "brightness": RGB_DEFAULT_BRIGHTNESS,
+                "speed": RGB_DEFAULT_SPEED,
                 "brightness_available": False,
                 "supports_free_color": False,
+                "speed_available": False,
                 "capabilities": {
                     "toggle": False,
                     "color": False,
                     "brightness": False,
                 },
+                "supported_modes": [],
+                "mode_capabilities": {},
+                "speed_options": list(RGB_SPEED_OPTIONS),
                 "presets": RGB_COLOR_PRESETS,
                 "details": support.get("reason", "Platform is not supported"),
             }
 
         backend = self._get_rgb_backend()
+        supported_modes = self._get_rgb_supported_modes(backend)
+        mode_capabilities = self._get_rgb_mode_capabilities(backend)
         if backend["type"] == "sysfs":
             enabled, color, brightness = self._read_rgb_state_from_led(backend["path"])
+            mode = self._get_saved_rgb_mode(backend)
+            speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
         elif backend["type"] == "legion_hid":
             enabled = bool(self.settings.get("rgb_enabled", False))
             color = self._normalize_rgb_color(
                 self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
             ) or RGB_COLOR_PRESETS[0]
             brightness = self._get_saved_rgb_brightness()
+            mode = self._get_saved_rgb_mode(backend)
+            speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
         else:
             enabled, color, brightness = False, RGB_COLOR_PRESETS[0], RGB_DEFAULT_BRIGHTNESS
+            mode = RGB_DEFAULT_MODE
+            speed = RGB_DEFAULT_SPEED
 
         return {
             "available": backend["type"] != "none",
             "enabled": enabled,
-            "mode": "solid",
+            "mode": mode,
             "color": color,
             "brightness": brightness,
+            "speed": speed,
             "brightness_available": backend["type"] != "none",
             "supports_free_color": backend["type"] != "none",
+            "speed_available": bool(mode_capabilities.get(mode, {}).get("speed", False)),
             "capabilities": {
                 "toggle": backend["type"] != "none",
-                "color": backend["type"] != "none",
+                "color": bool(mode_capabilities.get(mode, {}).get("color", backend["type"] != "none")),
                 "brightness": backend["type"] != "none",
             },
+            "supported_modes": supported_modes,
+            "mode_capabilities": mode_capabilities,
+            "speed_options": list(RGB_SPEED_OPTIONS),
             "presets": RGB_COLOR_PRESETS,
             "details": backend["details"],
         }
@@ -1650,11 +1764,15 @@ class Plugin:
                 self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
             ) or RGB_COLOR_PRESETS[0]
             current_brightness = self._get_saved_rgb_brightness()
+            current_mode = self._get_saved_rgb_mode(backend)
+            current_speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
             success = self._write_legion_hid_rgb(
                 backend["device"],
                 current_color,
                 enabled,
                 current_brightness,
+                current_mode,
+                current_speed,
             )
 
         if not success:
@@ -1688,11 +1806,15 @@ class Plugin:
         else:
             enabled = bool(self.settings.get("rgb_enabled", False))
             brightness = self._get_saved_rgb_brightness()
+            mode = self._get_saved_rgb_mode(backend)
+            speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
             success = self._write_legion_hid_rgb(
                 backend["device"],
                 normalized,
                 enabled,
                 brightness,
+                mode,
+                speed,
             )
 
         if not success:
@@ -1731,6 +1853,8 @@ class Plugin:
             current_color = self._normalize_rgb_color(
                 self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
             ) or RGB_COLOR_PRESETS[0]
+            mode = self._get_saved_rgb_mode(backend)
+            speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
             success = True
             if enabled:
                 success = self._write_legion_hid_rgb(
@@ -1738,12 +1862,90 @@ class Plugin:
                     current_color,
                     enabled,
                     normalized_brightness,
+                    mode,
+                    speed,
                 )
 
         if not success:
             return False
 
         self.settings["rgb_brightness"] = normalized_brightness
+        self._save_settings()
+        return True
+
+    async def set_rgb_mode(self, mode: str) -> bool:
+        support = self._get_current_platform_support()
+        if not support.get("supported", False):
+            decky.logger.warning(support.get("reason", "Platform is not supported"))
+            return False
+
+        backend = self._get_rgb_backend()
+        supported_modes = self._get_rgb_supported_modes(backend)
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode not in supported_modes:
+            decky.logger.warning(f"Unsupported RGB mode: {mode}")
+            return False
+
+        enabled = bool(self.settings.get("rgb_enabled", False))
+        current_color = self._normalize_rgb_color(
+            self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
+        ) or RGB_COLOR_PRESETS[0]
+        current_brightness = self._get_saved_rgb_brightness()
+        current_speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
+
+        success = True
+        if backend["type"] == "legion_hid" and enabled:
+            success = self._write_legion_hid_rgb(
+                backend["device"],
+                current_color,
+                enabled,
+                current_brightness,
+                normalized_mode,
+                current_speed,
+            )
+
+        if not success:
+            return False
+
+        self.settings["rgb_mode"] = normalized_mode
+        self._save_settings()
+        return True
+
+    async def set_rgb_speed(self, speed: str) -> bool:
+        support = self._get_current_platform_support()
+        if not support.get("supported", False):
+            decky.logger.warning(support.get("reason", "Platform is not supported"))
+            return False
+
+        backend = self._get_rgb_backend()
+        normalized_speed = self._normalize_rgb_speed(speed)
+        current_mode = self._get_saved_rgb_mode(backend)
+        mode_capabilities = self._get_rgb_mode_capabilities(backend)
+        if not mode_capabilities.get(current_mode, {}).get("speed", False):
+            decky.logger.warning(f"RGB speed is not supported for mode: {current_mode}")
+            return False
+
+        enabled = bool(self.settings.get("rgb_enabled", False))
+        current_color = self._normalize_rgb_color(
+            self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
+        ) or RGB_COLOR_PRESETS[0]
+        current_brightness = self._get_saved_rgb_brightness()
+
+        success = True
+        if backend["type"] == "legion_hid" and enabled:
+            success = self._write_legion_hid_rgb(
+                backend["device"],
+                current_color,
+                enabled,
+                current_brightness,
+                current_mode,
+                normalized_speed,
+            )
+
+        if not success:
+            return False
+
+        self.settings["rgb_speed"] = normalized_speed
         self._save_settings()
         return True
 

@@ -33,6 +33,16 @@ const RGB_PRESET_LABELS: Record<string, string> = {
   "#FFFFFF": "White",
   "#0000FF": "Blue",
 };
+const RGB_MODE_LABELS: Record<string, string> = {
+  solid: "Solid",
+  pulse: "Pulse",
+  rainbow: "Rainbow",
+};
+const RGB_SPEED_LABELS: Record<string, string> = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+};
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.max(min, Math.min(max, value));
@@ -123,6 +133,8 @@ const setSmtEnabled = callable<[boolean], boolean>("set_smt_enabled");
 const setRgbEnabled = callable<[boolean], boolean>("set_rgb_enabled");
 const setRgbColor = callable<[string], boolean>("set_rgb_color");
 const setRgbBrightness = callable<[number], boolean>("set_rgb_brightness");
+const setRgbMode = callable<[string], boolean>("set_rgb_mode");
+const setRgbSpeed = callable<[string], boolean>("set_rgb_speed");
 const setDisplaySyncSetting = callable<[string, boolean], boolean>(
   "set_display_sync_setting"
 );
@@ -153,13 +165,25 @@ interface RgbState {
   mode: string;
   color: string;
   brightness: number;
+  speed: string;
   brightness_available: boolean;
   supports_free_color: boolean;
+  speed_available: boolean;
   capabilities: {
     toggle: boolean;
     color: boolean;
     brightness: boolean;
   };
+  supported_modes: string[];
+  mode_capabilities: Record<
+    string,
+    {
+      color: boolean;
+      brightness: boolean;
+      speed: boolean;
+    }
+  >;
+  speed_options: string[];
   presets: string[];
   details: string;
 }
@@ -410,6 +434,19 @@ const rgbQuickSwatchButtonStyle = (
   overflow: "hidden",
   minHeight: "54px",
   cursor: "pointer",
+});
+
+const rgbModeButtonStyle = (active: boolean): React.CSSProperties => ({
+  width: "100%",
+  borderRadius: "10px",
+  padding: "10px 8px",
+  textAlign: "left",
+  background: active
+    ? "linear-gradient(180deg, #60a5fa, #3b82f6)"
+    : "linear-gradient(180deg, rgba(51,65,85,0.92), rgba(30,41,59,0.92))",
+  border: active
+    ? "1px solid rgba(191, 219, 254, 0.9)"
+    : "1px solid rgba(100, 116, 139, 0.35)",
 });
 
 const modeButtonStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
@@ -1054,12 +1091,19 @@ const RGBView: VFC<{
   const [brightnessValue, setBrightnessValue] = useState<number>(
     clamp(rgb?.brightness ?? 100, 0, 100)
   );
+  const [selectedMode, setSelectedMode] = useState<string>(rgb?.mode ?? "solid");
+  const [selectedSpeed, setSelectedSpeed] = useState<string>(rgb?.speed ?? "medium");
   const activeColor = selectedColor;
+  const supportedModes = rgb?.supported_modes?.length ? rgb.supported_modes : ["solid"];
+  const currentModeCapabilities = rgb?.mode_capabilities?.[selectedMode] ?? {
+    color: true,
+    brightness: true,
+    speed: false,
+  };
   const canToggleRgb = Boolean(rgb?.capabilities?.toggle ?? rgb?.available);
-  const canAdjustColor = Boolean(rgb?.capabilities?.color ?? rgb?.supports_free_color);
-  const canAdjustBrightness = Boolean(
-    rgb?.capabilities?.brightness ?? rgb?.brightness_available
-  );
+  const canAdjustColor = Boolean(currentModeCapabilities.color && (rgb?.supports_free_color ?? true));
+  const canAdjustBrightness = Boolean(currentModeCapabilities.brightness && (rgb?.brightness_available ?? true));
+  const canAdjustSpeed = Boolean(currentModeCapabilities.speed && (rgb?.speed_available ?? true));
   const controlScopeLabel = rgb?.enabled ? "Live output" : "Next output on enable";
   const controlScopeDescription = rgb?.enabled
     ? "Changes apply immediately."
@@ -1073,6 +1117,14 @@ const RGBView: VFC<{
   useEffect(() => {
     setBrightnessValue(clamp(rgb?.brightness ?? 100, 0, 100));
   }, [rgb?.brightness]);
+
+  useEffect(() => {
+    setSelectedMode(rgb?.mode ?? "solid");
+  }, [rgb?.mode]);
+
+  useEffect(() => {
+    setSelectedSpeed(rgb?.speed ?? "medium");
+  }, [rgb?.speed]);
 
   const runAction = async (
     actionKey: string,
@@ -1124,6 +1176,24 @@ const RGBView: VFC<{
       () => setRgbBrightness(normalized),
       `RGB brightness: ${normalized}%`,
       "Could not change RGB brightness"
+    );
+  };
+
+  const handleRgbMode = async (mode: string) => {
+    await runAction(
+      `rgb-mode:${mode}`,
+      () => setRgbMode(mode),
+      `RGB mode: ${RGB_MODE_LABELS[mode] || mode}`,
+      "Could not change RGB mode"
+    );
+  };
+
+  const handleRgbSpeed = async (speed: string) => {
+    await runAction(
+      `rgb-speed:${speed}`,
+      () => setRgbSpeed(speed),
+      `RGB speed: ${RGB_SPEED_LABELS[speed] || speed}`,
+      "Could not change RGB speed"
     );
   };
 
@@ -1187,7 +1257,7 @@ const RGBView: VFC<{
                         {controlScopeLabel}
                       </div>
                       <div style={{ ...subtextStyle, color: "rgba(255,255,255,0.8)" }}>
-                        {rgb.mode === "solid" ? "Solid color profile" : rgb.mode}
+                        {RGB_MODE_LABELS[selectedMode] || selectedMode}
                       </div>
                     </div>
                     <div
@@ -1225,6 +1295,61 @@ const RGBView: VFC<{
                       />
                     ))}
                   </div>
+                </div>
+              </div>
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <div style={cardStyle}>
+                <div style={viewTitleStyle}>Mode</div>
+                <div style={subtextStyle}>
+                  Native RGB modes only. Legion HID gets hardware `pulse` and `rainbow`; sysfs
+                  stays on clean `solid`.
+                </div>
+                <div style={optionGridStyle}>
+                  {supportedModes.map((mode) => {
+                    const active = selectedMode === mode;
+                    return (
+                      <ButtonItem
+                        key={mode}
+                        layout="below"
+                        disabled={controlsDisabled}
+                        onClick={() => {
+                          if (mode === selectedMode) {
+                            return;
+                          }
+                          setSelectedMode(mode);
+                          void handleRgbMode(mode);
+                        }}
+                      >
+                        <div style={rgbModeButtonStyle(active)}>
+                          <div
+                            style={{
+                              color: active ? "#0f172a" : "#ffffff",
+                              fontSize: "12px",
+                              fontWeight: 800,
+                            }}
+                          >
+                            {RGB_MODE_LABELS[mode] || mode}
+                          </div>
+                          <div
+                            style={{
+                              color: active ? "rgba(15,23,42,0.82)" : "#cbd5e1",
+                              fontSize: "10px",
+                              marginTop: "4px",
+                              lineHeight: 1.35,
+                            }}
+                          >
+                            {mode === "solid"
+                              ? "Static color"
+                              : mode === "pulse"
+                                ? "Native breathing effect"
+                                : "Native cycling effect"}
+                          </div>
+                        </div>
+                      </ButtonItem>
+                    );
+                  })}
                 </div>
               </div>
             </PanelSectionRow>
@@ -1316,6 +1441,50 @@ const RGBView: VFC<{
                 }}
               />
             </PanelSectionRow>
+
+            {canAdjustSpeed && (
+              <PanelSectionRow>
+                <div style={cardStyle}>
+                  <div style={viewTitleStyle}>Animation Speed</div>
+                  <div style={subtextStyle}>
+                    Native animation speed for the current RGB mode.
+                  </div>
+                  <div style={optionGridStyle}>
+                    {(rgb.speed_options?.length ? rgb.speed_options : ["low", "medium", "high"]).map(
+                      (speed) => {
+                        const active = selectedSpeed === speed;
+                        return (
+                          <ButtonItem
+                            key={speed}
+                            layout="below"
+                            disabled={controlsDisabled}
+                            onClick={() => {
+                              if (speed === selectedSpeed) {
+                                return;
+                              }
+                              setSelectedSpeed(speed);
+                              void handleRgbSpeed(speed);
+                            }}
+                          >
+                            <div style={rgbModeButtonStyle(active)}>
+                              <div
+                                style={{
+                                  color: active ? "#0f172a" : "#ffffff",
+                                  fontSize: "12px",
+                                  fontWeight: 800,
+                                }}
+                              >
+                                {RGB_SPEED_LABELS[speed] || speed}
+                              </div>
+                            </div>
+                          </ButtonItem>
+                        );
+                      }
+                    )}
+                  </div>
+                </div>
+              </PanelSectionRow>
+            )}
 
             <PanelSectionRow>
               <div style={cardStyle}>
