@@ -1731,19 +1731,28 @@ class Plugin:
             return []
 
         refresh_rates = set()
-        for token in output.split():
-            candidate = token.rstrip("*+")
-            if "." not in candidate:
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped or not line[:1].isspace():
                 continue
 
-            try:
-                value = float(candidate)
-            except ValueError:
+            parts = stripped.split()
+            if not parts or "x" not in parts[0]:
                 continue
 
-            rounded = int(round(value))
-            if rounded >= FPS_HIGH_REFRESH_MIN:
-                refresh_rates.add(rounded)
+            for token in parts[1:]:
+                candidate = token.rstrip("*+")
+                if not candidate or any(char not in "0123456789." for char in candidate):
+                    continue
+
+                try:
+                    value = float(candidate)
+                except ValueError:
+                    continue
+
+                rounded = int(round(value))
+                if rounded >= FPS_HIGH_REFRESH_MIN:
+                    refresh_rates.add(rounded)
 
         return sorted(refresh_rates)
 

@@ -605,6 +605,23 @@ eDP-1 connected primary 1920x1080+0+0
 
         self.assertEqual(rates, [90, 120, 144, 165])
 
+    def test_supported_high_refresh_rates_accept_integer_xrandr_values(self):
+        plugin = main.Plugin()
+        output = """
+Screen 0: minimum 16 x 16, current 1920 x 1080, maximum 32767 x 32767
+eDP-1 connected primary 1920x1080+0+0
+   1920x1080     120*+ 90 60
+"""
+
+        with patch.object(plugin, "_command_exists", return_value=True), patch.object(
+            plugin,
+            "_run_command_output",
+            return_value=(True, output),
+        ):
+            rates = plugin._get_supported_high_refresh_rates()
+
+        self.assertEqual(rates, [90, 120])
+
     def test_fps_limit_rejects_values_outside_supported_presets(self):
         plugin = main.Plugin()
         plugin.settings = {"fps_limit": 0}

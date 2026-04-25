@@ -3,6 +3,7 @@ import {
   PanelSection,
   PanelSectionRow,
   ButtonItem,
+  SliderField,
   ToggleField,
   staticClasses,
 } from "@decky/ui";
@@ -246,6 +247,14 @@ const optionGridStyle: React.CSSProperties = {
   width: "100%",
 };
 
+const fpsSliderMetaStyle: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: "12px",
+  marginTop: "4px",
+};
+
 const presetButtonStyle = (active: boolean): React.CSSProperties => ({
   borderRadius: "10px",
   padding: "8px 6px",
@@ -422,6 +431,14 @@ const DashboardView: VFC<{
   const fpsPresets = data?.fps_limit.presets?.length
     ? data.fps_limit.presets
     : [30, 40, 60, 0];
+  const normalizedCurrentFpsPreset = fpsPresets.includes(data?.fps_limit.current ?? 0)
+    ? data?.fps_limit.current ?? 0
+    : fpsPresets.includes(60)
+      ? 60
+      : fpsPresets[0];
+  const normalizedFpsPresetIndex = Math.max(0, fpsPresets.indexOf(normalizedCurrentFpsPreset));
+  const [fpsPresetIndex, setFpsPresetIndex] = useState<number>(normalizedFpsPresetIndex);
+  const fpsPresetValue = fpsPresets[fpsPresetIndex] ?? normalizedCurrentFpsPreset;
 
   const runAction = async (
     actionKey: string,
@@ -500,6 +517,10 @@ const DashboardView: VFC<{
       "Could not change the max framerate"
     );
   };
+
+  useEffect(() => {
+    setFpsPresetIndex(normalizedFpsPresetIndex);
+  }, [normalizedFpsPresetIndex]);
 
   const handleRgbToggle = async (enabled: boolean) => {
     await runAction(
@@ -725,23 +746,44 @@ const DashboardView: VFC<{
         <div style={cardStyle}>
           <div style={viewTitleStyle}>Max Framerate</div>
           <div style={subtextStyle}>{data.fps_limit.details}</div>
+          <div style={fpsSliderMetaStyle}>
+            <div style={{ ...subtextStyle, color: "#cbd5e1" }}>
+              {data.fps_limit.is_live ? "Live gamescope value" : "Preset selection"}
+            </div>
+            <div style={{ color: "#ffffff", fontSize: "12px", fontWeight: 700 }}>
+              {formatFpsLabel(fpsPresetValue)}
+            </div>
+          </div>
         </div>
       </PanelSectionRow>
       <PanelSectionRow>
-        <div style={optionGridStyle}>
-          {fpsPresets.map((preset) => (
-            <ButtonItem
-              key={preset}
-              layout="below"
-              disabled={!data.fps_limit.available || controlsDisabled}
-              onClick={() => commitFpsLimit(preset)}
-            >
-              <div style={presetButtonStyle(data.fps_limit.current === preset)}>
-                {formatFpsLabel(preset)}
-              </div>
-            </ButtonItem>
-          ))}
-        </div>
+        <SliderField
+          label={`Max Framerate: ${formatFpsLabel(fpsPresetValue)}`}
+          description={data.fps_limit.available ? "Horizontal preset selector" : data.fps_limit.status}
+          value={fpsPresetIndex}
+          min={0}
+          max={Math.max(0, fpsPresets.length - 1)}
+          step={1}
+          disabled={!data.fps_limit.available || controlsDisabled}
+          showValue={false}
+          notchCount={fpsPresets.length}
+          notchTicksVisible
+          validValues="steps"
+          notchLabels={fpsPresets.map((preset, notchIndex) => ({
+            notchIndex,
+            label: preset === 0 ? "Off" : `${preset}`,
+            value: notchIndex,
+          }))}
+          onChange={(value: number) => {
+            const nextIndex = Math.max(0, Math.min(fpsPresets.length - 1, value));
+            const nextPreset = fpsPresets[nextIndex];
+            if (nextPreset === undefined || nextIndex === fpsPresetIndex) {
+              return;
+            }
+            setFpsPresetIndex(nextIndex);
+            void commitFpsLimit(nextPreset);
+          }}
+        />
       </PanelSectionRow>
 
       <PanelSectionRow>
