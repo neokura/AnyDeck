@@ -1347,12 +1347,47 @@ eDP-1 connected primary 1920x1080+0+0
             success = asyncio.run(plugin.set_rgb_mode("spiral"))
 
         self.assertTrue(state["available"])
-        self.assertIn("ASUS ROG Ally", state["details"])
+        self.assertIn("ASUS Handheld", state["details"])
         self.assertEqual(state["supported_modes"], ["solid", "pulse", "rainbow", "spiral"])
         self.assertTrue(success)
         self.assertEqual(FakeHidDevice.writes[0][:5], bytes([0x5A, 0xD1, 0x09, 0x01, 0x02]))
         self.assertEqual(FakeHidDevice.writes[1][:5], bytes([0x5A, 0xBA, 0xC5, 0xC4, 0x03]))
         self.assertEqual(FakeHidDevice.writes[2][:8], bytes([0x5A, 0xB3, 0x00, 0x03, 0x00, 0x00, 0x00, 0xEB]))
+
+    def test_asus_hid_backend_accepts_new_asus_handheld_pids_with_same_usage_signature(self):
+        plugin = main.Plugin()
+        plugin.settings_path = None
+        plugin.settings = {
+            "rgb_enabled": True,
+            "rgb_color": "#FF00FF",
+            "rgb_brightness": 100,
+            "rgb_mode": "rainbow",
+            "rgb_speed": "medium",
+        }
+        FakeHidDevice.writes = []
+        FakeHidModule.devices = [
+            {
+                "path": b"/dev/hidraw-future-asus",
+                "vendor_id": 0x0B05,
+                "product_id": 0xFFFF,
+                "usage_page": 0xFF31,
+                "usage": 0x0080,
+                "interface_number": 0,
+            }
+        ]
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin, "_get_rgb_led_path", return_value=""
+        ), patch.object(
+            plugin, "_hid_module", return_value=FakeHidModule
+        ), patch.object(
+            plugin, "_hidraw_devices", return_value=[]
+        ):
+            state = asyncio.run(plugin.get_rgb_state())
+
+        self.assertTrue(state["available"])
+        self.assertIn("ASUS Handheld", state["details"])
+        self.assertEqual(state["supported_modes"], ["solid", "pulse", "rainbow", "spiral"])
 
     def test_rgb_state_is_exposed_in_dashboard(self):
         plugin = main.Plugin()

@@ -134,9 +134,9 @@ LEGION_GO_TABLET_HID = {
     "protocol": "legion_go_tablet",
 }
 ASUS_ALLY_HID = {
-    "name": "ASUS ROG Ally HID RGB",
+    "name": "ASUS Handheld HID RGB",
     "vid": 0x0B05,
-    "pids": [0x1ABE, 0x1B4C],
+    "pids": [],
     "usage_page": 0xFF31,
     "usage": 0x0080,
     "interface": None,
@@ -921,7 +921,8 @@ class Plugin:
     def _hid_device_matches_config(self, device: dict, config: dict) -> bool:
         if device.get("vendor_id") != config["vid"]:
             return False
-        if device.get("product_id") not in config["pids"]:
+        product_ids = config.get("pids") or []
+        if product_ids and device.get("product_id") not in product_ids:
             return False
         if config.get("interface") is not None and device.get("interface_number") is not None:
             if device.get("interface_number") != config["interface"]:
