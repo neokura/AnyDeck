@@ -248,9 +248,9 @@ const optionGridStyle: React.CSSProperties = {
 
 const presetButtonStyle = (active: boolean): React.CSSProperties => ({
   borderRadius: "10px",
-  padding: "10px 8px",
+  padding: "8px 6px",
   textAlign: "center",
-  fontSize: "12px",
+  fontSize: "11px",
   fontWeight: 700,
   color: active ? "#0f172a" : "#ffffff",
   background: active ? "#60a5fa" : "rgba(51, 65, 85, 0.85)",
@@ -262,7 +262,7 @@ const presetButtonStyle = (active: boolean): React.CSSProperties => ({
 const modeButtonStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
   width: "100%",
   borderRadius: "12px",
-  padding: "12px",
+  padding: "9px 10px",
   background: active
     ? "linear-gradient(180deg, #60a5fa, #3b82f6)"
     : "linear-gradient(180deg, rgba(51,65,85,0.9), rgba(30,41,59,0.9))",
@@ -585,24 +585,33 @@ const DashboardView: VFC<{
                   gap: "12px",
                 }}
               >
-                <div style={{ color: mode.active ? "#0f172a" : "#ffffff", fontWeight: 800 }}>
-                  {mode.label}
-                </div>
                 <div
                   style={{
-                    color: mode.active ? "#0f172a" : "#94a3b8",
-                    fontSize: "12px",
-                    fontWeight: 700,
+                    color: mode.active ? "#0f172a" : "#ffffff",
+                    fontWeight: 800,
+                    fontSize: "13px",
                   }}
                 >
-                  {mode.active ? "Active" : "SteamOS native"}
+                  {mode.label}
                 </div>
+                {mode.active && (
+                  <div
+                    style={{
+                      color: "#0f172a",
+                      fontSize: "11px",
+                      fontWeight: 700,
+                    }}
+                  >
+                    Active
+                  </div>
+                )}
               </div>
               <div
                 style={{
                   color: mode.active ? "rgba(15,23,42,0.85)" : "#cbd5e1",
-                  fontSize: "12px",
-                  marginTop: "6px",
+                  fontSize: "11px",
+                  marginTop: "4px",
+                  lineHeight: 1.35,
                 }}
               >
                 {mode.available ? mode.description : "Mode unavailable on this system"}
