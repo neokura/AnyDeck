@@ -128,6 +128,7 @@ const enableAvailableOptimizations = callable<[], BulkOptimizationResult>(
 const getInformationState = callable<[], InformationState>(
   "get_information_state"
 );
+const clearDebugLog = callable<[], boolean>("clear_debug_log");
 const setPerformanceProfile = callable<[string], boolean>("set_performance_profile");
 const setCpuBoostEnabled = callable<[boolean], boolean>("set_cpu_boost_enabled");
 const setSmtEnabled = callable<[boolean], boolean>("set_smt_enabled");
@@ -309,6 +310,16 @@ interface InformationState {
   optimizations: OptimizationState[];
   hardware_controls: Record<string, boolean>;
   fps_limit: FpsLimitState;
+  debug_log: DebugLogEntry[];
+}
+
+interface DebugLogEntry {
+  timestamp: string;
+  area: string;
+  action: string;
+  status: string;
+  message: string;
+  details: Record<string, unknown>;
 }
 
 type ViewName = "dashboard" | "rgb" | "optimizations" | "information";
@@ -343,6 +354,15 @@ const statusRowStyle: React.CSSProperties = {
   alignItems: "flex-start",
   gap: "12px",
   marginBottom: "6px",
+};
+
+const debugLogStyle: React.CSSProperties = {
+  fontSize: "11px",
+  lineHeight: 1.45,
+  color: "#dbe4ee",
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
+  fontFamily: "monospace",
 };
 
 const infoLabelStyle: React.CSSProperties = {
@@ -471,11 +491,15 @@ const compactModeButtonStyle = (active: boolean, disabled: boolean): React.CSSPr
 const statusColor = (status: string): string => {
   switch (status) {
     case "active":
+    case "success":
       return "#4ade80";
+    case "attempt":
     case "configured":
+    case "snapshot":
       return "#60a5fa";
     case "reboot-required":
       return "#f59e0b";
+    case "error":
     case "unavailable":
       return "#f87171";
     default:
@@ -1583,9 +1607,12 @@ const InformationView: VFC<{
   data: InformationState | null;
   loading: boolean;
   error: string | null;
+  busyKey: string | null;
   onBack: () => void;
   onRefresh: () => Promise<void>;
-}> = ({ data, loading, error, onBack, onRefresh }) => {
+  onClearDebug: () => Promise<void>;
+}> = ({ data, loading, error, busyKey, onBack, onRefresh, onClearDebug }) => {
+  const controlsDisabled = busyKey !== null;
   return (
     <div>
       <ViewHeader
@@ -1784,6 +1811,59 @@ const InformationView: VFC<{
               </div>
             </PanelSectionRow>
           </PanelSection>
+
+          <PanelSection title="Debug">
+            <PanelSectionRow>
+              <div style={cardStyle}>
+                <div style={{ ...statusRowStyle, marginBottom: "8px" }}>
+                  <div style={{ color: "#ffffff", fontSize: "12px", fontWeight: 700 }}>
+                    Runtime Log
+                  </div>
+                  <div style={{ color: "#94a3b8", fontSize: "11px" }}>
+                    {data.debug_log.length} entries
+                  </div>
+                </div>
+                <div style={subtextStyle}>
+                  Tracks attempts, successes, failures, and state snapshots for performance,
+                  CPU, display, optimizations, and RGB controls.
+                </div>
+              </div>
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ButtonItem layout="below" disabled={controlsDisabled} onClick={() => void onClearDebug()}>
+                Clear Debug Log
+              </ButtonItem>
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <div style={cardStyle}>
+                {data.debug_log.length === 0 ? (
+                  <div style={subtextStyle}>No debug entries yet.</div>
+                ) : (
+                  [...data.debug_log].reverse().map((entry, index) => (
+                    <div
+                      key={`${entry.timestamp}-${index}`}
+                      style={{
+                        padding: "8px 0",
+                        borderBottom:
+                          index === data.debug_log.length - 1
+                            ? "none"
+                            : "1px solid rgba(148, 163, 184, 0.15)",
+                      }}
+                    >
+                      <div style={{ ...debugLogStyle, color: statusColor(entry.status) }}>
+                        [{entry.status.toUpperCase()}] {entry.area}.{entry.action}
+                      </div>
+                      <div style={{ ...debugLogStyle, color: "#94a3b8" }}>{entry.timestamp}</div>
+                      <div style={debugLogStyle}>{entry.message}</div>
+                      <div style={{ ...debugLogStyle, color: "#8fb7ff" }}>
+                        {JSON.stringify(entry.details)}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </PanelSectionRow>
+          </PanelSection>
         </div>
       )}
     </div>
@@ -1850,6 +1930,26 @@ const XboxCompanionContent: VFC = () => {
     }
   };
 
+  const handleClearDebugLog = async () => {
+    setBusyKey("information");
+    try {
+      const success = await clearDebugLog();
+      toaster.toast({
+        title: PLUGIN_NAME,
+        body: success ? "Debug log cleared" : "Could not clear debug log",
+      });
+      await refreshInformation();
+    } catch (error) {
+      console.error("Failed to clear debug log:", error);
+      toaster.toast({
+        title: PLUGIN_NAME,
+        body: "Could not clear debug log",
+      });
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
   useEffect(() => {
     if (view === "dashboard" || view === "rgb") {
       void refreshDashboard();
@@ -1902,8 +2002,10 @@ const XboxCompanionContent: VFC = () => {
         data={information}
         loading={loading}
         error={informationError}
+        busyKey={busyKey}
         onBack={() => setView("dashboard")}
         onRefresh={refreshInformation}
+        onClearDebug={handleClearDebugLog}
       />
     );
   }

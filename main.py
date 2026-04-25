@@ -8,6 +8,7 @@ Licensed under MIT
 import os
 import json
 import math
+import datetime
 import subprocess
 import shlex
 import glob
@@ -100,6 +101,7 @@ RGB_DEFAULT_MODE = "solid"
 RGB_SPEED_OPTIONS = ("low", "medium", "high")
 RGB_DEFAULT_SPEED = "medium"
 DEFAULT_COMMAND_TIMEOUT = 5
+DEBUG_LOG_LIMIT = 250
 SYSTEM_COMMAND_ENV_DROP_KEYS = {
     "LD_LIBRARY_PATH",
     "LD_PRELOAD",
@@ -773,6 +775,38 @@ class Plugin:
         self.settings: dict = {}
         self.steamos_manager: SteamOsManagerClient | None = None
         self.gamescope_settings: GamescopeSettingsClient | None = None
+        self.debug_log: list[dict] = []
+
+    def _debug_event(self, area: str, action: str, status: str, message: str, details=None):
+        entry = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "area": area,
+            "action": action,
+            "status": status,
+            "message": message,
+            "details": details if details is not None else {},
+        }
+        self.debug_log.append(entry)
+        if len(self.debug_log) > DEBUG_LOG_LIMIT:
+            self.debug_log = self.debug_log[-DEBUG_LOG_LIMIT:]
+        return entry
+
+    def _debug_success(self, area: str, action: str, message: str, details=None):
+        self._debug_event(area, action, "success", message, details)
+
+    def _debug_failure(self, area: str, action: str, message: str, details=None):
+        self._debug_event(area, action, "error", message, details)
+
+    def _debug_attempt(self, area: str, action: str, message: str, details=None):
+        self._debug_event(area, action, "attempt", message, details)
+
+    async def get_debug_log(self) -> list[dict]:
+        return list(self.debug_log)
+
+    async def clear_debug_log(self) -> bool:
+        self.debug_log = []
+        self._debug_success("debug", "clear", "Debug log cleared")
+        return True
 
     async def _main(self):
         """Main entry point for the plugin"""
@@ -781,6 +815,7 @@ class Plugin:
         self.gamescope_settings = GamescopeSettingsClient(decky.logger)
         await self.load_settings()
         decky.logger.info(f"{PLUGIN_NAME} initialized")
+        self._debug_success("plugin", "init", f"{PLUGIN_NAME} initialized")
 
     async def _unload(self):
         """Cleanup when plugin is unloaded"""
@@ -1946,14 +1981,17 @@ class Plugin:
         }
 
     async def set_rgb_enabled(self, enabled: bool) -> bool:
+        self._debug_attempt("rgb", "set_enabled", "Changing RGB enabled state", {"enabled": enabled})
         support = self._get_current_platform_support()
         if not support.get("supported", False):
             decky.logger.warning(support.get("reason", "Platform is not supported"))
+            self._debug_failure("rgb", "set_enabled", support.get("reason", "Platform is not supported"))
             return False
 
         backend = self._get_rgb_backend()
         if backend["type"] == "none":
             decky.logger.warning("RGB control not available")
+            self._debug_failure("rgb", "set_enabled", "RGB control not available")
             return False
 
         if backend["type"] == "sysfs":
@@ -1981,28 +2019,34 @@ class Plugin:
             )
 
         if not success:
+            self._debug_failure("rgb", "set_enabled", "Failed to write RGB state", {"backend": backend["type"]})
             return False
 
         self.settings["rgb_enabled"] = enabled
         self.settings["rgb_color"] = current_color
         self.settings["rgb_brightness"] = current_brightness
         self._save_settings()
+        self._debug_success("rgb", "set_enabled", f"RGB {'enabled' if enabled else 'disabled'}", {"backend": backend["type"], "color": current_color, "brightness": current_brightness})
         return True
 
     async def set_rgb_color(self, color: str) -> bool:
+        self._debug_attempt("rgb", "set_color", "Changing RGB color", {"color": color})
         support = self._get_current_platform_support()
         if not support.get("supported", False):
             decky.logger.warning(support.get("reason", "Platform is not supported"))
+            self._debug_failure("rgb", "set_color", support.get("reason", "Platform is not supported"))
             return False
 
         backend = self._get_rgb_backend()
         if backend["type"] == "none":
             decky.logger.warning("RGB control not available")
+            self._debug_failure("rgb", "set_color", "RGB control not available")
             return False
 
         normalized = self._normalize_rgb_color(color)
         if normalized is None:
             decky.logger.warning(f"Unsupported RGB color value: {color}")
+            self._debug_failure("rgb", "set_color", "Unsupported RGB color value", {"color": color})
             return False
 
         if backend["type"] == "sysfs":
@@ -2023,22 +2067,27 @@ class Plugin:
             )
 
         if not success:
+            self._debug_failure("rgb", "set_color", "Failed to apply RGB color", {"backend": backend["type"], "color": normalized})
             return False
 
         self.settings["rgb_color"] = normalized
         self.settings["rgb_brightness"] = brightness
         self._save_settings()
+        self._debug_success("rgb", "set_color", "RGB color applied", {"backend": backend["type"], "color": normalized, "brightness": brightness})
         return True
 
     async def set_rgb_brightness(self, brightness: int) -> bool:
+        self._debug_attempt("rgb", "set_brightness", "Changing RGB brightness", {"brightness": brightness})
         support = self._get_current_platform_support()
         if not support.get("supported", False):
             decky.logger.warning(support.get("reason", "Platform is not supported"))
+            self._debug_failure("rgb", "set_brightness", support.get("reason", "Platform is not supported"))
             return False
 
         backend = self._get_rgb_backend()
         if backend["type"] == "none":
             decky.logger.warning("RGB control not available")
+            self._debug_failure("rgb", "set_brightness", "RGB control not available")
             return False
 
         normalized_brightness = self._normalize_rgb_brightness(brightness)
@@ -2072,16 +2121,20 @@ class Plugin:
                 )
 
         if not success:
+            self._debug_failure("rgb", "set_brightness", "Failed to apply RGB brightness", {"backend": backend["type"], "brightness": normalized_brightness})
             return False
 
         self.settings["rgb_brightness"] = normalized_brightness
         self._save_settings()
+        self._debug_success("rgb", "set_brightness", "RGB brightness applied", {"backend": backend["type"], "brightness": normalized_brightness})
         return True
 
     async def set_rgb_mode(self, mode: str) -> bool:
+        self._debug_attempt("rgb", "set_mode", "Changing RGB mode", {"mode": mode})
         support = self._get_current_platform_support()
         if not support.get("supported", False):
             decky.logger.warning(support.get("reason", "Platform is not supported"))
+            self._debug_failure("rgb", "set_mode", support.get("reason", "Platform is not supported"))
             return False
 
         backend = self._get_rgb_backend()
@@ -2089,6 +2142,7 @@ class Plugin:
         normalized_mode = str(mode or "").strip().lower()
         if normalized_mode not in supported_modes:
             decky.logger.warning(f"Unsupported RGB mode: {mode}")
+            self._debug_failure("rgb", "set_mode", "Unsupported RGB mode", {"mode": mode, "supported_modes": supported_modes})
             return False
 
         enabled = bool(self.settings.get("rgb_enabled", False))
@@ -2110,16 +2164,20 @@ class Plugin:
             )
 
         if not success:
+            self._debug_failure("rgb", "set_mode", "Failed to apply RGB mode", {"backend": backend["type"], "mode": normalized_mode})
             return False
 
         self.settings["rgb_mode"] = normalized_mode
         self._save_settings()
+        self._debug_success("rgb", "set_mode", "RGB mode applied", {"backend": backend["type"], "mode": normalized_mode})
         return True
 
     async def set_rgb_speed(self, speed: str) -> bool:
+        self._debug_attempt("rgb", "set_speed", "Changing RGB speed", {"speed": speed})
         support = self._get_current_platform_support()
         if not support.get("supported", False):
             decky.logger.warning(support.get("reason", "Platform is not supported"))
+            self._debug_failure("rgb", "set_speed", support.get("reason", "Platform is not supported"))
             return False
 
         backend = self._get_rgb_backend()
@@ -2128,6 +2186,7 @@ class Plugin:
         mode_capabilities = self._get_rgb_mode_capabilities(backend)
         if not mode_capabilities.get(current_mode, {}).get("speed", False):
             decky.logger.warning(f"RGB speed is not supported for mode: {current_mode}")
+            self._debug_failure("rgb", "set_speed", "RGB speed unsupported for current mode", {"mode": current_mode, "speed": normalized_speed})
             return False
 
         enabled = bool(self.settings.get("rgb_enabled", False))
@@ -2148,10 +2207,12 @@ class Plugin:
             )
 
         if not success:
+            self._debug_failure("rgb", "set_speed", "Failed to apply RGB speed", {"backend": backend["type"], "mode": current_mode, "speed": normalized_speed})
             return False
 
         self.settings["rgb_speed"] = normalized_speed
         self._save_settings()
+        self._debug_success("rgb", "set_speed", "RGB speed applied", {"backend": backend["type"], "mode": current_mode, "speed": normalized_speed})
         return True
 
     def _command_exists(self, cmd: str) -> bool:
@@ -2877,9 +2938,11 @@ class Plugin:
 
     async def set_optimization_enabled(self, key: str, enabled: bool) -> bool:
         try:
+            self._debug_attempt("optimization", "set_enabled", "Toggling optimization", {"key": key, "enabled": enabled})
             support = self._get_current_platform_support()
             if not support.get("supported", False):
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
+                self._debug_failure("optimization", "set_enabled", support.get("reason", "Platform is not supported"), {"key": key, "enabled": enabled})
                 return False
 
             handlers = self._optimization_handlers()
@@ -2889,20 +2952,28 @@ class Plugin:
             state_reader = states.get(key)
             if handler is None or state_reader is None:
                 decky.logger.error(f"Unknown optimization: {key}")
+                self._debug_failure("optimization", "set_enabled", "Unknown optimization", {"key": key, "enabled": enabled})
                 return False
 
             before = state_reader()
             if not before.get("available", True):
                 decky.logger.warning(f"Optimization unavailable: {key}")
+                self._debug_failure("optimization", "set_enabled", "Optimization unavailable", {"key": key, "enabled": enabled, "before": before})
                 return False
 
             handler(enabled)
             state = state_reader()
+            success = state.get("enabled", False) if enabled else not state.get("enabled", False)
+            if success:
+                self._debug_success("optimization", "set_enabled", "Optimization updated", {"key": key, "enabled": enabled, "before": before, "after": state})
+            else:
+                self._debug_failure("optimization", "set_enabled", "Optimization state did not change as requested", {"key": key, "enabled": enabled, "before": before, "after": state})
             if enabled:
-                return state.get("enabled", False)
-            return not state.get("enabled", False)
+                return success
+            return success
         except Exception as e:
             decky.logger.error(f"Failed to toggle optimization {key}: {e}")
+            self._debug_failure("optimization", "set_enabled", f"Failed to toggle optimization: {e}", {"key": key, "enabled": enabled})
             return False
 
     async def enable_available_optimizations(self) -> dict:
@@ -3157,13 +3228,16 @@ class Plugin:
 
     async def set_performance_profile(self, profile_id: str) -> bool:
         try:
+            self._debug_attempt("performance", "set_profile", "Changing performance profile", {"profile_id": profile_id})
             support = self._get_current_platform_support()
             if not support.get("supported", False):
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
+                self._debug_failure("performance", "set_profile", support.get("reason", "Platform is not supported"), {"profile_id": profile_id})
                 return False
 
             if profile_id not in NATIVE_PERFORMANCE_PROFILES:
                 decky.logger.error(f"Unknown profile: {profile_id}")
+                self._debug_failure("performance", "set_profile", "Unknown profile", {"profile_id": profile_id})
                 return False
 
             if self.steamos_manager is None:
@@ -3172,23 +3246,28 @@ class Plugin:
             native_state = self.steamos_manager.get_performance_state()
             if not native_state.get("available", False):
                 decky.logger.warning(native_state.get("status", "SteamOS native profiles unavailable"))
+                self._debug_failure("performance", "set_profile", native_state.get("status", "SteamOS native profiles unavailable"), {"profile_id": profile_id, "state": native_state})
                 return False
 
             if profile_id not in native_state.get("available_native", []):
                 decky.logger.warning(f"SteamOS performance profile is not available: {profile_id}")
+                self._debug_failure("performance", "set_profile", "Requested profile unavailable", {"profile_id": profile_id, "available_native": native_state.get("available_native", [])})
                 return False
 
             success, error = self.steamos_manager.set_performance_profile(profile_id)
             if not success:
                 decky.logger.error(f"Failed to set SteamOS performance profile: {error}")
+                self._debug_failure("performance", "set_profile", f"Failed to set SteamOS performance profile: {error}", {"profile_id": profile_id})
                 return False
             
             profile_name = NATIVE_PERFORMANCE_PROFILES[profile_id]["name"]
             decky.logger.info(f"Applied SteamOS performance profile: {profile_name} ({profile_id})")
+            self._debug_success("performance", "set_profile", "Performance profile applied", {"profile_id": profile_id, "profile_name": profile_name})
             return True
             
         except Exception as e:
             decky.logger.error(f"Failed to set performance profile: {e}")
+            self._debug_failure("performance", "set_profile", f"Failed to set performance profile: {e}", {"profile_id": profile_id})
             return False
 
     async def get_display_sync_state(self) -> dict:
@@ -3222,9 +3301,11 @@ class Plugin:
 
     async def set_display_sync_setting(self, key: str, enabled: bool) -> bool:
         try:
+            self._debug_attempt("display", "set_sync", "Changing display sync setting", {"key": key, "enabled": enabled})
             support = self._get_current_platform_support()
             if not support.get("supported", False):
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
+                self._debug_failure("display", "set_sync", support.get("reason", "Platform is not supported"), {"key": key, "enabled": enabled})
                 return False
 
             if self.gamescope_settings is None:
@@ -3236,18 +3317,22 @@ class Plugin:
                 success, error = self.gamescope_settings.set_vsync_enabled(enabled)
             else:
                 decky.logger.error(f"Unknown display sync setting: {key}")
+                self._debug_failure("display", "set_sync", "Unknown display sync setting", {"key": key, "enabled": enabled})
                 return False
 
             if not success:
                 decky.logger.warning(f"Failed to set display sync setting {key}: {error}")
+                self._debug_failure("display", "set_sync", f"Failed to set display sync setting: {error}", {"key": key, "enabled": enabled})
                 return False
 
             decky.logger.info(
                 f"Set display sync setting {key} to {'enabled' if enabled else 'disabled'}"
             )
+            self._debug_success("display", "set_sync", "Display sync setting updated", {"key": key, "enabled": enabled})
             return True
         except Exception as e:
             decky.logger.error(f"Failed to set display sync setting {key}: {e}")
+            self._debug_failure("display", "set_sync", f"Failed to set display sync setting: {e}", {"key": key, "enabled": enabled})
             return False
 
     async def get_fps_limit_state(self) -> dict:
@@ -3316,18 +3401,22 @@ class Plugin:
         }
 
     async def set_fps_limit(self, value: int) -> bool:
+        self._debug_attempt("display", "set_fps_limit", "Changing framerate limit", {"value": value})
         support = self._get_current_platform_support()
         if not support.get("supported", False):
             decky.logger.warning(support.get("reason", "Platform is not supported"))
+            self._debug_failure("display", "set_fps_limit", support.get("reason", "Platform is not supported"), {"value": value})
             return False
 
         value = max(0, int(value))
         if not self._command_exists("gamescopectl"):
             decky.logger.warning("gamescopectl is not installed")
+            self._debug_failure("display", "set_fps_limit", "gamescopectl is not installed", {"value": value})
             return False
 
         if value not in self._get_fps_presets():
             decky.logger.warning(f"Unsupported framerate preset: {value}")
+            self._debug_failure("display", "set_fps_limit", "Unsupported framerate preset", {"value": value, "supported": self._get_fps_presets()})
             return False
 
         success = False
@@ -3341,6 +3430,7 @@ class Plugin:
                 break
         if not success:
             decky.logger.error(f"Failed to set framerate limit: {error}")
+            self._debug_failure("display", "set_fps_limit", f"Failed to set framerate limit: {error}", {"value": value})
             return False
 
         decky.logger.info(
@@ -3348,6 +3438,7 @@ class Plugin:
             if value == 0
             else f"Applied gamescope framerate limit: {value}"
         )
+        self._debug_success("display", "set_fps_limit", "Framerate limit updated", {"value": value})
         return True
 
     async def get_charge_limit_state(self) -> dict:
@@ -3368,9 +3459,11 @@ class Plugin:
 
     async def set_charge_limit_enabled(self, enabled: bool) -> bool:
         try:
+            self._debug_attempt("power", "set_charge_limit", "Changing battery charge limit", {"enabled": enabled})
             support = self._get_current_platform_support()
             if not support.get("supported", False):
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
+                self._debug_failure("power", "set_charge_limit", support.get("reason", "Platform is not supported"), {"enabled": enabled})
                 return False
 
             if self.steamos_manager is None:
@@ -3379,14 +3472,17 @@ class Plugin:
             success, error = self.steamos_manager.set_charge_limit_enabled(enabled)
             if not success:
                 decky.logger.warning(f"Failed to set SteamOS charge limit: {error}")
+                self._debug_failure("power", "set_charge_limit", f"Failed to set SteamOS charge limit: {error}", {"enabled": enabled})
                 return False
 
             decky.logger.info(
                 f"SteamOS charge limit {'enabled' if enabled else 'disabled'}"
             )
+            self._debug_success("power", "set_charge_limit", "Battery charge limit updated", {"enabled": enabled})
             return True
         except Exception as e:
             decky.logger.error(f"Failed to set SteamOS charge limit: {e}")
+            self._debug_failure("power", "set_charge_limit", f"Failed to set SteamOS charge limit: {e}", {"enabled": enabled})
             return False
 
     async def get_smt_state(self) -> dict:
@@ -3428,9 +3524,11 @@ class Plugin:
 
     async def set_smt_enabled(self, enabled: bool) -> bool:
         try:
+            self._debug_attempt("cpu", "set_smt", "Changing SMT state", {"enabled": enabled})
             support = self._get_current_platform_support()
             if not support.get("supported", False):
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
+                self._debug_failure("cpu", "set_smt", support.get("reason", "Platform is not supported"), {"enabled": enabled})
                 return False
 
             if self.steamos_manager is None:
@@ -3441,6 +3539,7 @@ class Plugin:
                 success, error = self.steamos_manager.set_smt_enabled(enabled)
                 if not success:
                     decky.logger.warning(f"Failed to set SteamOS SMT: {error}")
+                    self._debug_failure("cpu", "set_smt", f"Failed to set SteamOS SMT: {error}", {"enabled": enabled})
                     return False
             elif os.path.exists(SMT_CONTROL_PATH):
                 success, error = self._write_file(
@@ -3450,18 +3549,23 @@ class Plugin:
                 )
                 if not success:
                     decky.logger.warning(f"Failed to set kernel SMT state: {error}")
+                    self._debug_failure("cpu", "set_smt", f"Failed to set kernel SMT state: {error}", {"enabled": enabled})
                     return False
             else:
                 decky.logger.warning("SMT control unavailable")
+                self._debug_failure("cpu", "set_smt", "SMT control unavailable", {"enabled": enabled})
                 return False
 
             decky.logger.info(f"SMT {'enabled' if enabled else 'disabled'}")
+            self._debug_success("cpu", "set_smt", "SMT updated", {"enabled": enabled})
             return True
         except PermissionError:
             decky.logger.error("Permission denied setting SMT - requires root")
+            self._debug_failure("cpu", "set_smt", "Permission denied setting SMT", {"enabled": enabled})
             return False
         except Exception as e:
             decky.logger.error(f"Failed to set SMT: {e}")
+            self._debug_failure("cpu", "set_smt", f"Failed to set SMT: {e}", {"enabled": enabled})
             return False
 
     async def get_current_tdp(self) -> dict:
@@ -3561,9 +3665,11 @@ class Plugin:
     async def set_cpu_boost_enabled(self, enabled: bool) -> bool:
         """Enable or disable CPU boost"""
         try:
+            self._debug_attempt("cpu", "set_boost", "Changing CPU boost state", {"enabled": enabled})
             support = self._get_current_platform_support()
             if not support.get("supported", False):
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
+                self._debug_failure("cpu", "set_boost", support.get("reason", "Platform is not supported"), {"enabled": enabled})
                 return False
 
             if self.steamos_manager is None:
@@ -3574,26 +3680,32 @@ class Plugin:
                 success, error = self.steamos_manager.set_cpu_boost_enabled(enabled)
                 if not success:
                     decky.logger.warning(f"Failed to set SteamOS CPU boost: {error}")
+                    self._debug_failure("cpu", "set_boost", f"Failed to set SteamOS CPU boost: {error}", {"enabled": enabled})
                     return False
             else:
                 if not os.path.exists(CPU_BOOST_PATH):
                     decky.logger.warning("CPU boost control not available")
+                    self._debug_failure("cpu", "set_boost", "CPU boost control not available", {"enabled": enabled})
                     return False
 
                 value = "1" if enabled else "0"
                 success, error = self._write_file(CPU_BOOST_PATH, value, use_sudo=True)
                 if not success:
                     decky.logger.warning(f"Failed to set CPU boost: {error}")
+                    self._debug_failure("cpu", "set_boost", f"Failed to set CPU boost: {error}", {"enabled": enabled})
                     return False
 
             decky.logger.info(f"CPU boost {'enabled' if enabled else 'disabled'}")
+            self._debug_success("cpu", "set_boost", "CPU boost updated", {"enabled": enabled, "native": native_state.get("available", False)})
             return True
             
         except PermissionError:
             decky.logger.error("Permission denied setting CPU boost - requires root")
+            self._debug_failure("cpu", "set_boost", "Permission denied setting CPU boost", {"enabled": enabled})
             return False
         except Exception as e:
             decky.logger.error(f"Failed to set CPU boost: {e}")
+            self._debug_failure("cpu", "set_boost", f"Failed to set CPU boost: {e}", {"enabled": enabled})
             return False
 
     async def get_dashboard_state(self) -> dict:
@@ -3664,6 +3776,28 @@ class Plugin:
             ),
         }
 
+        snapshot = {
+            "performance_status": profiles.get("status", ""),
+            "performance_current": profiles.get("current", ""),
+            "cpu_boost_available": cpu.get("boost_available", False),
+            "cpu_boost_enabled": cpu.get("boost_enabled", False),
+            "smt_available": cpu.get("smt_available", False),
+            "smt_enabled": cpu.get("smt_enabled", False),
+            "vrr_available": sync.get("vrr", {}).get("available", False),
+            "vrr_enabled": sync.get("vrr", {}).get("enabled", False),
+            "vsync_available": sync.get("vsync", {}).get("available", False),
+            "vsync_enabled": sync.get("vsync", {}).get("enabled", False),
+            "fps_available": fps_limit.get("available", False),
+            "fps_current": fps_limit.get("current", 0),
+            "charge_limit_available": charge_limit.get("available", False),
+            "charge_limit_enabled": charge_limit.get("enabled", False),
+            "rgb_available": rgb.get("available", False),
+            "rgb_mode": rgb.get("mode", ""),
+            "rgb_enabled": rgb.get("enabled", False),
+            "optimizations_available": [state.get("key") for state in optimizations.get("states", []) if state.get("available", False)],
+        }
+        self._debug_event("information", "refresh", "snapshot", "Information view refreshed", snapshot)
+
         return {
             "device": device,
             "battery": battery,
@@ -3682,4 +3816,5 @@ class Plugin:
             "optimizations": optimizations.get("states", []),
             "hardware_controls": hardware_controls,
             "fps_limit": fps_limit,
+            "debug_log": list(self.debug_log),
         }

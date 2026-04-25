@@ -1450,6 +1450,94 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertEqual(state["rgb"]["color"], "#00FFFF")
         self.assertEqual(state["rgb"]["brightness"], 75)
 
+    def test_information_state_exposes_debug_log_snapshot(self):
+        plugin = main.Plugin()
+        plugin._debug_event("test", "seed", "attempt", "Seeded log", {"ok": True})
+
+        async def fake_device():
+            return {
+                "friendly_name": "Test Device",
+                "sys_vendor": "ASUS",
+                "variant": "test",
+                "board_name": "board",
+                "support_level": "supported",
+                "platform_supported": True,
+                "platform_support_reason": "ok",
+                "steamos_version": "3.8.0",
+                "bios_version": "1.0",
+                "serial": "123",
+                "cpu": "cpu",
+                "gpu": "gpu",
+                "kernel": "kernel",
+                "memory_total": "16 GB",
+            }
+
+        async def fake_battery():
+            return {
+                "present": True,
+                "status": "Charging",
+                "capacity": 50,
+                "health": 100,
+                "cycle_count": 1,
+                "voltage": 1,
+                "current": 1,
+                "temperature": 30,
+                "design_capacity": 1,
+                "full_capacity": 1,
+                "charge_limit": 80,
+                "time_to_empty": "Unknown",
+                "time_to_full": "1h",
+            }
+
+        async def fake_profiles():
+            return {"current": "balanced", "available_native": ["balanced"], "status": "available", "available": True}
+
+        async def fake_sync():
+            return {"vrr": {"available": False, "enabled": False}, "vsync": {"available": True, "enabled": True}}
+
+        async def fake_tdp():
+            return {"tdp": 15, "cpu_temp": 50, "gpu_temp": 45, "gpu_clock": 1000}
+
+        async def fake_cpu():
+            return {"boost_available": True, "boost_enabled": False, "smt_available": False, "smt_enabled": False}
+
+        async def fake_rgb():
+            return {"available": True, "enabled": True, "mode": "solid"}
+
+        async def fake_opt():
+            return {"states": [{"key": "lavd", "available": True}]}
+
+        async def fake_fps():
+            return {"available": True, "current": 40}
+
+        async def fake_charge():
+            return {"available": True, "enabled": True}
+
+        with patch.object(plugin, "get_device_info", fake_device), patch.object(
+            plugin, "get_battery_info", fake_battery
+        ), patch.object(
+            plugin, "get_performance_profiles", fake_profiles
+        ), patch.object(
+            plugin, "get_display_sync_state", fake_sync
+        ), patch.object(
+            plugin, "get_current_tdp", fake_tdp
+        ), patch.object(
+            plugin, "get_cpu_settings", fake_cpu
+        ), patch.object(
+            plugin, "get_rgb_state", fake_rgb
+        ), patch.object(
+            plugin, "get_optimization_states", fake_opt
+        ), patch.object(
+            plugin, "get_fps_limit_state", fake_fps
+        ), patch.object(
+            plugin, "get_charge_limit_state", fake_charge
+        ):
+            state = asyncio.run(plugin.get_information_state())
+
+        self.assertIn("debug_log", state)
+        self.assertGreaterEqual(len(state["debug_log"]), 2)
+        self.assertEqual(state["debug_log"][-1]["action"], "refresh")
+
 
 class OptimizationStateTest(unittest.TestCase):
     def test_swap_protect_state_reports_configured_and_active(self):
