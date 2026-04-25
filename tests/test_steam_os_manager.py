@@ -171,7 +171,8 @@ class SteamOsManagerClientTest(unittest.TestCase):
 
         self.assertTrue(state["available"])
         self.assertEqual(state["current"], "balanced")
-        first_cmd, first_kwargs = calls[0]
+        bus_calls = [(cmd, kwargs) for cmd, kwargs in calls if "busctl" in cmd]
+        first_cmd, first_kwargs = bus_calls[0]
         self.assertIn("--user", first_cmd)
         env = first_kwargs.get("env", {})
         self.assertTrue(env.get("DBUS_SESSION_BUS_ADDRESS", "").startswith("unix:path="))
@@ -359,6 +360,61 @@ class SteamOsManagerClientTest(unittest.TestCase):
         self.assertIn("does not expose", state["details"])
 
 
+class HostRuntimeTest(unittest.TestCase):
+    def test_os_release_prefers_host_paths_before_runtime_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            host_os_release = os.path.join(tmpdir, "host-os-release")
+            runtime_os_release = os.path.join(tmpdir, "runtime-os-release")
+            with open(host_os_release, "w") as f:
+                f.write('ID=steamos\nPRETTY_NAME="SteamOS"\n')
+            with open(runtime_os_release, "w") as f:
+                f.write('ID=org.freedesktop.platform\nPRETTY_NAME="Freedesktop SDK"\n')
+
+            with patch("main.HOST_OS_RELEASE_PATHS", (host_os_release, runtime_os_release)):
+                runtime = main.HostRuntime()
+                path, values = runtime.get_os_release()
+
+        self.assertEqual(path, host_os_release)
+        self.assertEqual(values["ID"], "steamos")
+
+    def test_resolve_command_uses_flatpak_spawn_host_when_direct_binary_is_missing(self):
+        def fake_which(cmd):
+            if cmd == "flatpak-spawn":
+                return "/usr/bin/flatpak-spawn"
+            return None
+
+        def fake_exists(path):
+            return path in {"/run/host/etc/os-release", "/run/host/usr/bin/busctl"}
+
+        with patch("main.shutil.which", side_effect=fake_which), patch(
+            "main.os.path.exists",
+            side_effect=fake_exists,
+        ), patch("main.os.access", return_value=True):
+            runtime = main.HostRuntime()
+            info = runtime.resolve_command("busctl")
+
+        self.assertTrue(info["available"])
+        self.assertTrue(info["via_host"])
+        self.assertEqual(info["path"], "/run/host/usr/bin/busctl")
+
+    def test_host_env_loads_gamescope_environment_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gamescope_env = os.path.join(tmpdir, "gamescope-environment")
+            with open(gamescope_env, "w") as f:
+                f.write("DISPLAY=:0\n")
+                f.write("XAUTHORITY=/run/user/1000/xauth_test\n")
+                f.write("GAMESCOPE_WAYLAND_DISPLAY=gamescope-0\n")
+
+            runtime = main.HostRuntime()
+            runtime.gamescope_env_path = gamescope_env
+            runtime._host_env_cache = None
+            env = runtime.host_env()
+
+        self.assertEqual(env["DISPLAY"], ":0")
+        self.assertEqual(env["XAUTHORITY"], "/run/user/1000/xauth_test")
+        self.assertEqual(env["GAMESCOPE_WAYLAND_DISPLAY"], "gamescope-0")
+
+
 class GamescopeSettingsClientTest(unittest.TestCase):
     def test_reads_gamescope_display_sync_state(self):
         outputs = {
@@ -398,10 +454,11 @@ class GamescopeSettingsClientTest(unittest.TestCase):
         self.assertEqual(enabled_error, "")
         self.assertTrue(disabled)
         self.assertEqual(disabled_error, "")
-        self.assertEqual(calls[0][-2], main.GAMESCOPE_ALLOW_TEARING_ATOM)
-        self.assertEqual(calls[0][-1], "0")
-        self.assertEqual(calls[1][-2], main.GAMESCOPE_ALLOW_TEARING_ATOM)
-        self.assertEqual(calls[1][-1], "1")
+        xprop_calls = [call for call in calls if "xprop" in call]
+        self.assertEqual(xprop_calls[0][-2], main.GAMESCOPE_ALLOW_TEARING_ATOM)
+        self.assertEqual(xprop_calls[0][-1], "0")
+        self.assertEqual(xprop_calls[1][-2], main.GAMESCOPE_ALLOW_TEARING_ATOM)
+        self.assertEqual(xprop_calls[1][-1], "1")
 
     def test_rejects_vrr_when_display_is_not_capable(self):
         def fake_run(cmd, **_kwargs):
@@ -898,8 +955,8 @@ eDP-1 connected primary 1920x1080+0+0
 
         with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
             plugin,
-            "_command_exists",
-            return_value=True,
+            "_command_info",
+            return_value={"available": True, "path": "/run/host/usr/bin/gamescopectl", "via_host": True},
         ), patch.object(
             plugin,
             "_run_command_output",
@@ -916,8 +973,8 @@ eDP-1 connected primary 1920x1080+0+0
 
         with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
             plugin,
-            "_command_exists",
-            return_value=False,
+            "_command_info",
+            return_value={"available": False, "path": "", "via_host": False},
         ), patch.object(
             main.GamescopeSettingsClient,
             "get_fps_limit_state",
@@ -928,6 +985,28 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertTrue(state["available"])
         self.assertEqual(state["current"], 60)
         self.assertTrue(state["is_live"])
+
+    def test_fps_limit_state_reports_runtime_error_when_gamescopectl_cannot_connect(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin,
+            "_command_info",
+            return_value={"available": True, "path": "/run/host/usr/bin/gamescopectl", "via_host": True},
+        ), patch.object(
+            plugin,
+            "_run_command_output",
+            return_value=(False, "Failed to open GAMESCOPE_WAYLAND_DISPLAY."),
+        ), patch.object(
+            main.GamescopeSettingsClient,
+            "get_fps_limit_state",
+            return_value=(False, 0, "GAMESCOPE_FPS_LIMIT is not available", ""),
+        ):
+            state = asyncio.run(plugin.get_fps_limit_state())
+
+        self.assertFalse(state["available"])
+        self.assertIn("GAMESCOPE_WAYLAND_DISPLAY", state["status"])
+        self.assertIn("GAMESCOPE_WAYLAND_DISPLAY", state["details"])
 
     def test_charge_limit_returns_false_when_control_is_unavailable(self):
         plugin = main.Plugin()
@@ -1083,7 +1162,11 @@ eDP-1 connected primary 1920x1080+0+0
 
             plugin = main.Plugin()
 
-            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch(
+            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+                plugin,
+                "_legion_hid_candidates",
+                return_value=[],
+            ), patch(
                 "main.ALLY_LED_PATH", os.path.join(tmpdir, "missing")
             ), patch(
                 "main.RGB_LED_PATH_GLOBS", [os.path.join(tmpdir, "*:rgb:*")]
@@ -1119,7 +1202,11 @@ eDP-1 connected primary 1920x1080+0+0
 
             plugin = main.Plugin()
 
-            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch(
+            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+                plugin,
+                "_legion_hid_candidates",
+                return_value=[],
+            ), patch(
                 "main.ALLY_LED_PATH", led
             ), patch(
                 "main.RGB_LED_PATH_GLOBS", []
@@ -1145,7 +1232,11 @@ eDP-1 connected primary 1920x1080+0+0
 
             plugin = main.Plugin()
 
-            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch(
+            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+                plugin,
+                "_legion_hid_candidates",
+                return_value=[],
+            ), patch(
                 "main.ALLY_LED_PATH", led
             ), patch(
                 "main.RGB_LED_PATH_GLOBS", []
@@ -1575,6 +1666,109 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertIn("debug_log", state)
         self.assertGreaterEqual(len(state["debug_log"]), 2)
         self.assertEqual(state["debug_log"][-1]["action"], "refresh")
+
+    def test_information_state_includes_runtime_diagnostics(self):
+        plugin = main.Plugin()
+        plugin.steamos_manager = types.SimpleNamespace(get_active_bus=lambda: "user")
+
+        async def fake_device():
+            return {
+                "friendly_name": "ROG Xbox Ally X",
+                "sys_vendor": "ASUS",
+                "variant": "RC73XA",
+                "board_name": "RC73XA",
+                "support_level": "supported",
+                "platform_supported": True,
+                "platform_support_reason": "Supported",
+                "steamos_version": "SteamOS",
+                "bios_version": "316",
+                "serial": "123",
+                "cpu": "AMD Ryzen Z2 Extreme",
+                "gpu": "AMD Radeon",
+                "kernel": "6.x",
+                "memory_total": "24 GB",
+            }
+
+        async def fake_battery():
+            return {
+                "present": True,
+                "status": "Charging",
+                "capacity": 80,
+                "health": 100,
+                "cycle_count": 1,
+                "voltage": 16.8,
+                "current": 0,
+                "temperature": 30,
+                "design_capacity": 1,
+                "full_capacity": 1,
+                "charge_limit": 80,
+                "time_to_empty": "Unknown",
+                "time_to_full": "Unknown",
+            }
+
+        async def fake_profiles():
+            return {"current": "balanced", "available_native": ["balanced"], "status": "available", "available": True}
+
+        async def fake_sync():
+            return {"vrr": {"available": False, "enabled": False}, "vsync": {"available": True, "enabled": False}}
+
+        async def fake_tdp():
+            return {"tdp": 15, "cpu_temp": 50, "gpu_temp": 45, "gpu_clock": 1000}
+
+        async def fake_cpu():
+            return {"boost_available": True, "boost_enabled": True, "smt_available": True, "smt_enabled": True}
+
+        async def fake_rgb():
+            return {"available": True, "enabled": True, "mode": "solid"}
+
+        async def fake_opt():
+            return {"states": []}
+
+        async def fake_fps():
+            return {"available": False, "current": 0}
+
+        async def fake_charge():
+            return {"available": True, "enabled": True}
+
+        with patch.object(plugin, "get_device_info", fake_device), patch.object(
+            plugin, "get_battery_info", fake_battery
+        ), patch.object(plugin, "get_performance_profiles", fake_profiles), patch.object(
+            plugin, "get_display_sync_state", fake_sync
+        ), patch.object(plugin, "get_current_tdp", fake_tdp), patch.object(
+            plugin, "get_cpu_settings", fake_cpu
+        ), patch.object(plugin, "get_rgb_state", fake_rgb), patch.object(
+            plugin, "get_optimization_states", fake_opt
+        ), patch.object(plugin, "get_fps_limit_state", fake_fps), patch.object(
+            plugin, "get_charge_limit_state", fake_charge
+        ), patch.object(
+            plugin.runtime,
+            "diagnostics",
+            return_value={
+                "execution_backend": "flatpak-host",
+                "os_release_path": "/run/host/etc/os-release",
+                "host_os_id": "steamos",
+                "commands": {
+                    "busctl": {"available": True, "path": "/run/host/usr/bin/busctl", "via_host": True},
+                    "gamescopectl": {"available": True, "path": "/run/host/usr/bin/gamescopectl", "via_host": True},
+                    "xprop": {"available": True, "path": "/run/host/usr/bin/xprop", "via_host": True},
+                    "systemctl": {"available": True, "path": "/run/host/usr/bin/systemctl", "via_host": True},
+                    "update-grub": {"available": True, "path": "/run/host/usr/bin/update-grub", "via_host": True},
+                },
+                "display_env": {
+                    "display": ":0",
+                    "xauthority": "/run/user/1000/xauth_test",
+                    "gamescope_env_path": "/run/user/1000/gamescope-environment",
+                    "gamescope_wayland_display": "gamescope-0",
+                },
+            },
+        ):
+            state = asyncio.run(plugin.get_information_state())
+
+        self.assertEqual(state["runtime"]["execution_backend"], "flatpak-host")
+        self.assertEqual(state["runtime"]["os_release_path"], "/run/host/etc/os-release")
+        self.assertEqual(state["runtime"]["steamos_manager_bus"], "user")
+        self.assertEqual(state["runtime"]["display_env"]["gamescope_wayland_display"], "gamescope-0")
+        self.assertTrue(state["runtime"]["commands"]["busctl"]["via_host"])
 
 
 class OptimizationStateTest(unittest.TestCase):
@@ -2033,6 +2227,10 @@ class OptimizationStateTest(unittest.TestCase):
             plugin,
             "_optimization_state_readers",
             return_value={"swap_protect": lambda: {"available": True, "enabled": True}},
+        ), patch.object(
+            plugin,
+            "_system_write_access_available",
+            return_value=True,
         ):
             result = asyncio.run(plugin.enable_available_optimizations())
 
@@ -2061,6 +2259,8 @@ class OptimizationStateTest(unittest.TestCase):
             plugin, "_set_lavd_enabled", return_value=None
         ), patch.object(
             plugin, "_get_lavd_state", return_value={"key": "lavd", "available": True, "enabled": True}
+        ), patch.object(
+            plugin, "_system_write_access_available", return_value=True
         ):
             result = asyncio.run(plugin.set_optimization_enabled("Lavd", True))
 
@@ -2075,6 +2275,8 @@ class OptimizationStateTest(unittest.TestCase):
             plugin,
             "_get_swap_protect_state",
             return_value={"enabled": False, "active": True},
+        ), patch.object(
+            plugin, "_system_write_access_available", return_value=True
         ):
             result = asyncio.run(plugin.set_optimization_enabled("swap_protect", False))
 
@@ -2089,6 +2291,8 @@ class OptimizationStateTest(unittest.TestCase):
             plugin,
             "_get_swap_protect_state",
             return_value={"enabled": False, "active": False},
+        ), patch.object(
+            plugin, "_system_write_access_available", return_value=True
         ):
             result = asyncio.run(plugin.set_optimization_enabled("swap_protect", False))
 

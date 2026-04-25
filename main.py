@@ -256,6 +256,34 @@ SYSTEM_PROTECTED_PREFIXES = (
     "/var/lib/",
 )
 
+HOST_OS_RELEASE_PATHS = (
+    "/run/host/etc/os-release",
+    "/run/host/usr/lib/os-release",
+    "/etc/os-release",
+    "/usr/lib/os-release",
+)
+HOST_COMMAND_CANDIDATE_DIRS = (
+    "/run/host/usr/bin",
+    "/run/host/bin",
+    "/usr/bin",
+    "/bin",
+)
+HOST_BRIDGED_COMMANDS = {
+    "busctl",
+    "gamescopectl",
+    "xprop",
+    "xrandr",
+    "systemctl",
+    "update-grub",
+    "sudo",
+    "tee",
+    "mkdir",
+    "chmod",
+    "rm",
+    "sysctl",
+    "lspci",
+}
+
 
 def needs_privilege_escalation(path: str | None = None) -> bool:
     if os.geteuid() == 0:
@@ -265,37 +293,228 @@ def needs_privilege_escalation(path: str | None = None) -> bool:
     normalized = os.path.abspath(path)
     return normalized.startswith(SYSTEM_PROTECTED_PREFIXES)
 
+
+class HostRuntime:
+    def __init__(self):
+        self.uid = os.getuid()
+        self.runtime_dir = f"/run/user/{self.uid}"
+        self.gamescope_env_path = os.path.join(self.runtime_dir, "gamescope-environment")
+        self._host_env_cache: dict | None = None
+        self._os_release_cache: tuple[str, dict] | None = None
+
+    def _read_key_value_file(self, path: str) -> dict:
+        values = {}
+        try:
+            with open(path, "r") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if "=" not in line or not line or line.startswith("#"):
+                        continue
+                    key, value = line.split("=", 1)
+                    values[key] = value.strip().strip('"').strip("'")
+        except Exception:
+            return {}
+        return values
+
+    def get_os_release(self) -> tuple[str, dict]:
+        if self._os_release_cache is not None:
+            return self._os_release_cache
+        for path in HOST_OS_RELEASE_PATHS:
+            if not os.path.exists(path):
+                continue
+            values = self._read_key_value_file(path)
+            if values:
+                self._os_release_cache = (path, values)
+                return self._os_release_cache
+        self._os_release_cache = ("", {})
+        return self._os_release_cache
+
+    def _host_environment_file_values(self) -> dict:
+        if not os.path.exists(self.gamescope_env_path):
+            if not self.can_bridge_host():
+                return {}
+            try:
+                result = subprocess.run(
+                    ["flatpak-spawn", "--host", "cat", self.gamescope_env_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=DEFAULT_COMMAND_TIMEOUT,
+                    env=sanitized_system_env(),
+                )
+            except Exception:
+                return {}
+            if result.returncode != 0:
+                return {}
+
+            values = {}
+            for raw_line in result.stdout.splitlines():
+                line = raw_line.strip()
+                if "=" not in line or not line or line.startswith("#"):
+                    continue
+                key, value = line.split("=", 1)
+                values[key] = value.strip().strip('"').strip("'")
+            return values
+        return self._read_key_value_file(self.gamescope_env_path)
+
+    def host_env(self, overrides: dict | None = None) -> dict:
+        if self._host_env_cache is None:
+            base = sanitized_system_env()
+            host_values = self._host_environment_file_values()
+            base.update(host_values)
+            base["PATH"] = host_values.get("PATH", base.get("PATH", "/usr/local/bin:/usr/bin:/bin"))
+            base.setdefault("XDG_RUNTIME_DIR", self.runtime_dir)
+            base.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={self.runtime_dir}/bus")
+            self._host_env_cache = base
+        env = dict(self._host_env_cache)
+        if overrides:
+            env.update(overrides)
+        return env
+
+    def steamos_bus_env(self) -> dict:
+        return self.host_env(
+            {
+                "XDG_RUNTIME_DIR": self.runtime_dir,
+                "DBUS_SESSION_BUS_ADDRESS": f"unix:path={self.runtime_dir}/bus",
+            }
+        )
+
+    def display_env(self, display: str | None = None) -> dict:
+        env = self.host_env()
+        if display:
+            env["DISPLAY"] = display
+        return env
+
+    def execution_backend(self) -> str:
+        if self.can_bridge_host():
+            return "flatpak-host"
+        return "direct"
+
+    def can_bridge_host(self) -> bool:
+        return shutil.which("flatpak-spawn") is not None and any(
+            os.path.exists(path) for path in HOST_OS_RELEASE_PATHS[:2]
+        )
+
+    def resolve_command(self, cmd: str) -> dict:
+        direct = shutil.which(cmd)
+        if direct:
+            return {"available": True, "path": direct, "via_host": False}
+
+        host_path = ""
+        for base in HOST_COMMAND_CANDIDATE_DIRS:
+            candidate = os.path.join(base, cmd)
+            if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                host_path = candidate
+                break
+
+        if host_path and cmd in HOST_BRIDGED_COMMANDS and self.can_bridge_host():
+            return {"available": True, "path": host_path, "via_host": True}
+
+        return {"available": False, "path": host_path, "via_host": False}
+
+    def _prepare_command(self, command: list[str]) -> tuple[list[str], dict]:
+        if not command:
+            raise FileNotFoundError("empty command")
+        info = self.resolve_command(command[0])
+        if not info["available"]:
+            raise FileNotFoundError(command[0])
+        if info["via_host"]:
+            return ["flatpak-spawn", "--host", *command], info
+        return command, info
+
+    def run(
+        self,
+        command: list[str],
+        *,
+        timeout: int = DEFAULT_COMMAND_TIMEOUT,
+        env: dict | None = None,
+        capture_output: bool = True,
+        text: bool = True,
+        input: str | None = None,
+    ) -> subprocess.CompletedProcess:
+        final_command, _info = self._prepare_command(command)
+        return subprocess.run(
+            final_command,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            env=env if env is not None else sanitized_system_env(),
+            input=input,
+        )
+
+    def run_host_command(
+        self,
+        command: list[str],
+        *,
+        timeout: int = DEFAULT_COMMAND_TIMEOUT,
+        env: dict | None = None,
+        capture_output: bool = True,
+        text: bool = True,
+        input: str | None = None,
+    ) -> subprocess.CompletedProcess:
+        final_command = ["flatpak-spawn", "--host", *command] if self.can_bridge_host() else command
+        return subprocess.run(
+            final_command,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            env=env if env is not None else sanitized_system_env(),
+            input=input,
+        )
+
+    def diagnostics(self) -> dict:
+        os_release_path, os_release_values = self.get_os_release()
+        host_env = self.host_env()
+        gamescope_env_loaded = bool(
+            host_env.get("GAMESCOPE_WAYLAND_DISPLAY")
+            or host_env.get("DISPLAY")
+            or host_env.get("XAUTHORITY")
+        )
+        commands = {}
+        for cmd in ("busctl", "gamescopectl", "xprop", "systemctl", "update-grub"):
+            info = self.resolve_command(cmd)
+            commands[cmd] = {
+                "available": info["available"],
+                "path": info["path"] or "",
+                "via_host": info["via_host"],
+            }
+
+        return {
+            "execution_backend": self.execution_backend(),
+            "os_release_path": os_release_path,
+            "host_os_id": os_release_values.get("ID", ""),
+            "commands": commands,
+            "display_env": {
+                "display": host_env.get("DISPLAY", ""),
+                "xauthority": host_env.get("XAUTHORITY", ""),
+                "gamescope_env_path": self.gamescope_env_path if gamescope_env_loaded else "",
+                "gamescope_wayland_display": host_env.get("GAMESCOPE_WAYLAND_DISPLAY", ""),
+            },
+        }
+
 class SteamOsManagerClient:
     """Small DBus client for SteamOS Manager via busctl."""
 
-    def __init__(self, logger):
+    def __init__(self, logger, runtime: HostRuntime | None = None):
         self.logger = logger
+        self.runtime = runtime or HostRuntime()
         self.user_bus_env = self._build_user_bus_env()
         self._interface_bus_cache: dict[str, str] = {}
 
     def _build_user_bus_env(self) -> dict:
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
-        if not runtime_dir:
-            runtime_dir = f"/run/user/{os.getuid()}"
-        address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
-        if not address:
-            address = f"unix:path={runtime_dir}/bus"
-        return sanitized_system_env(
-            {
-                "XDG_RUNTIME_DIR": runtime_dir,
-                "DBUS_SESSION_BUS_ADDRESS": address,
-            }
-        )
+        return self.runtime.steamos_bus_env()
 
     def _run_busctl(self, bus: str, args: list[str]) -> subprocess.CompletedProcess:
-        env = self.user_bus_env if bus == "user" else sanitized_system_env()
-        return subprocess.run(
+        env = self.user_bus_env if bus == "user" else self.runtime.host_env()
+        return self.runtime.run(
             ["busctl", f"--{bus}", *args],
-            capture_output=True,
-            text=True,
             timeout=5,
             env=env,
         )
+
+    def get_active_bus(self) -> str:
+        if not self._interface_bus_cache:
+            return "none"
+        return next(iter(self._interface_bus_cache.values()), "none") or "none"
 
     def _candidate_buses(self) -> list[str]:
         return ["user", "system"]
@@ -622,26 +841,31 @@ class SteamOsManagerClient:
 class GamescopeSettingsClient:
     """Small X11 root-property client for SteamOS gamescope settings."""
 
-    def __init__(self, logger, display: str | None = None):
+    def __init__(self, logger, runtime: HostRuntime | None = None, display: str | None = None):
         self.logger = logger
-        self.display = display or os.environ.get("DISPLAY") or ":0"
+        self.runtime = runtime or HostRuntime()
+        self.display = display or self.runtime.host_env().get("DISPLAY") or os.environ.get("DISPLAY") or ":0"
         self.display_candidates = self._build_display_candidates(display)
 
     def _build_display_candidates(self, preferred: str | None) -> list[str]:
         candidates = []
-        for candidate in (preferred, os.environ.get("DISPLAY"), ":0", ":1"):
+        for candidate in (
+            preferred,
+            self.runtime.host_env().get("DISPLAY"),
+            os.environ.get("DISPLAY"),
+            ":0",
+            ":1",
+        ):
             if candidate and candidate not in candidates:
                 candidates.append(candidate)
         return candidates or [":0"]
 
     def _xprop_env(self, display: str) -> dict:
-        return sanitized_system_env({"DISPLAY": display})
+        return self.runtime.display_env(display)
 
     def _run_xprop(self, args: list[str], display: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
+        return self.runtime.run(
             ["xprop", "-root", *args],
-            capture_output=True,
-            text=True,
             timeout=5,
             env=self._xprop_env(display),
         )
@@ -816,9 +1040,11 @@ class Plugin:
     def __init__(self):
         self.settings_path: str | None = None
         self.settings: dict = {}
+        self.runtime = HostRuntime()
         self.steamos_manager: SteamOsManagerClient | None = None
         self.gamescope_settings: GamescopeSettingsClient | None = None
         self.debug_log: list[dict] = []
+        self._sudo_available_cache: bool | None = None
 
     def _debug_event(self, area: str, action: str, status: str, message: str, details=None):
         entry = {
@@ -854,8 +1080,8 @@ class Plugin:
     async def _main(self):
         """Main entry point for the plugin"""
         self.settings_path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
-        self.steamos_manager = SteamOsManagerClient(decky.logger)
-        self.gamescope_settings = GamescopeSettingsClient(decky.logger)
+        self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
+        self.gamescope_settings = GamescopeSettingsClient(decky.logger, self.runtime)
         await self.load_settings()
         decky.logger.info(f"{PLUGIN_NAME} initialized")
         self._debug_success("plugin", "init", f"{PLUGIN_NAME} initialized")
@@ -1206,23 +1432,19 @@ class Plugin:
         return time_to_empty, time_to_full
 
     def _get_os_release_values(self) -> dict:
-        os_release = "/etc/os-release"
         try:
-            if not os.path.exists(os_release):
-                return {}
-
-            values = {}
-            with open(os_release, 'r') as f:
-                for line in f:
-                    if "=" not in line:
-                        continue
-                    key, value = line.strip().split("=", 1)
-                    values[key] = value.strip('"')
-
+            _path, values = self.runtime.get_os_release()
             return values
         except Exception as e:
             decky.logger.error(f"Failed to read OS release data: {e}")
             return {}
+
+    def _get_os_release_path(self) -> str:
+        try:
+            path, _values = self.runtime.get_os_release()
+            return path
+        except Exception:
+            return ""
 
     def _get_steamos_version(self, os_release_values: dict | None = None) -> str:
         values = os_release_values if os_release_values is not None else self._get_os_release_values()
@@ -2259,11 +2481,77 @@ class Plugin:
         return True
 
     def _command_exists(self, cmd: str) -> bool:
-        return shutil.which(cmd) is not None
+        return self.runtime.resolve_command(cmd).get("available", False)
+
+    def _command_info(self, cmd: str) -> dict:
+        return self.runtime.resolve_command(cmd)
+
+    def _is_system_protected_path(self, path: str | None) -> bool:
+        if not path:
+            return False
+        normalized = os.path.abspath(path)
+        return normalized.startswith(SYSTEM_PROTECTED_PREFIXES)
+
+    def _route_path_via_host(self, path: str | None) -> bool:
+        return bool(path) and self.runtime.execution_backend() == "flatpak-host" and self._is_system_protected_path(path)
+
+    def _needs_noninteractive_sudo(self, path: str | None = None) -> bool:
+        if os.geteuid() == 0:
+            return False
+        if path is not None:
+            return self._is_system_protected_path(path)
+        return True
+
+    def _has_noninteractive_sudo(self) -> bool:
+        if os.geteuid() == 0:
+            return True
+        if self._sudo_available_cache is not None:
+            return self._sudo_available_cache
+        try:
+            result = self.runtime.run_host_command(
+                ["sudo", "-n", "true"],
+                timeout=DEFAULT_COMMAND_TIMEOUT,
+                env=self.runtime.host_env(),
+            )
+            self._sudo_available_cache = result.returncode == 0
+        except Exception:
+            self._sudo_available_cache = False
+        return self._sudo_available_cache
+
+    def _host_file_exists(self, path: str) -> bool:
+        if not self._route_path_via_host(path):
+            return os.path.exists(path)
+        try:
+            result = self.runtime.run_host_command(
+                ["test", "-e", path],
+                timeout=DEFAULT_COMMAND_TIMEOUT,
+                env=self.runtime.host_env(),
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _read_text_file(self, path: str, default: str = "") -> str:
+        try:
+            if self._route_path_via_host(path):
+                result = self.runtime.run_host_command(
+                    ["cat", path],
+                    timeout=DEFAULT_COMMAND_TIMEOUT,
+                    env=self.runtime.host_env(),
+                )
+                if result.returncode != 0:
+                    return default
+                return result.stdout
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    return f.read()
+        except Exception:
+            pass
+        return default
 
     def _write_managed_file(self, path: str, content: str, mode: int | None = None):
         directory = os.path.dirname(path)
-        if needs_privilege_escalation(path):
+        if self._route_path_via_host(path) or needs_privilege_escalation(path):
             if directory:
                 self._run_command(["mkdir", "-p", directory], use_sudo=True)
             self._write_file(path, content, use_sudo=True)
@@ -2279,8 +2567,8 @@ class Plugin:
 
     def _remove_file(self, path: str):
         try:
-            if os.path.exists(path):
-                if needs_privilege_escalation(path):
+            if self._host_file_exists(path):
+                if self._route_path_via_host(path) or needs_privilege_escalation(path):
                     self._run_command(["rm", "-f", path], use_sudo=True)
                 else:
                     os.remove(path)
@@ -2326,7 +2614,7 @@ class Plugin:
         return self._file_contains_all(ATOMIC_MANIFEST_PATH, paths)
 
     def _migrate_atomic_manifest_if_needed(self):
-        if any(os.path.exists(path) for path in LEGACY_ATOMIC_PATHS):
+        if any(self._host_file_exists(path) for path in LEGACY_ATOMIC_PATHS):
             self._refresh_atomic_manifest()
 
     def _remove_managed_file(
@@ -2336,16 +2624,16 @@ class Plugin:
         skipped_files: list[str],
         errors: list[str],
         needles: list[str] | None = None,
-    ):
+        ):
         try:
-            if not os.path.exists(path):
+            if not self._host_file_exists(path):
                 return
 
             if needles and not self._file_contains_all(path, needles):
                 skipped_files.append(path)
                 return
 
-            if needs_privilege_escalation(OPTIMIZATION_STATE_PATH):
+            if self._route_path_via_host(path) or needs_privilege_escalation(OPTIMIZATION_STATE_PATH):
                 success, error = self._run_command(["rm", "-f", path], use_sudo=True)
                 if not success:
                     raise RuntimeError(error)
@@ -2357,13 +2645,16 @@ class Plugin:
 
     def _run_command(self, command: list[str], use_sudo: bool = False) -> tuple[bool, str]:
         try:
-            final_command = ["sudo", *command] if use_sudo and needs_privilege_escalation() else command
-            result = subprocess.run(
+            if use_sudo and self._needs_noninteractive_sudo():
+                if not self._has_noninteractive_sudo():
+                    return False, "Non-interactive sudo is unavailable for system writes"
+                final_command = ["sudo", "-n", *command]
+            else:
+                final_command = command
+            result = self.runtime.run_host_command(
                 final_command,
-                capture_output=True,
-                text=True,
                 timeout=20,
-                env=sanitized_system_env(),
+                env=self.runtime.host_env(),
             )
         except FileNotFoundError:
             return False, f"{command[0]} is not installed"
@@ -2379,14 +2670,27 @@ class Plugin:
 
     def _write_file(self, path: str, content: str, use_sudo: bool = False) -> tuple[bool, str]:
         try:
-            if use_sudo and needs_privilege_escalation(path):
-                result = subprocess.run(
-                    ["sudo", "tee", path],
+            if self._route_path_via_host(path):
+                if use_sudo and self._needs_noninteractive_sudo(path):
+                    if not self._has_noninteractive_sudo():
+                        return False, "Non-interactive sudo is unavailable for system writes"
+                    command = ["sudo", "-n", "tee", path]
+                else:
+                    command = ["tee", path]
+                result = self.runtime.run_host_command(
+                    command,
                     input=content,
-                    capture_output=True,
-                    text=True,
                     timeout=20,
-                    env=sanitized_system_env(),
+                    env=self.runtime.host_env(),
+                )
+            elif use_sudo and needs_privilege_escalation(path):
+                if not self._has_noninteractive_sudo():
+                    return False, "Non-interactive sudo is unavailable for system writes"
+                result = self.runtime.run_host_command(
+                    ["sudo", "-n", "tee", path],
+                    input=content,
+                    timeout=20,
+                    env=self.runtime.host_env(),
                 )
             else:
                 with open(path, "w") as f:
@@ -2406,12 +2710,10 @@ class Plugin:
 
     def _run_command_output(self, command: list[str]) -> tuple[bool, str]:
         try:
-            result = subprocess.run(
+            result = self.runtime.run(
                 command,
-                capture_output=True,
-                text=True,
                 timeout=20,
-                env=sanitized_system_env(),
+                env=self.runtime.host_env(),
             )
         except FileNotFoundError:
             return False, f"{command[0]} is not installed"
@@ -2434,10 +2736,9 @@ class Plugin:
 
     def _read_optimization_state(self) -> dict:
         try:
-            if not os.path.exists(OPTIMIZATION_STATE_PATH):
+            if not self._host_file_exists(OPTIMIZATION_STATE_PATH):
                 return {}
-            with open(OPTIMIZATION_STATE_PATH, "r") as f:
-                data = json.load(f)
+            data = json.loads(self._read_text_file(OPTIMIZATION_STATE_PATH, "{}"))
             return data if isinstance(data, dict) else {}
         except Exception as e:
             decky.logger.warning(f"Failed to read optimization state: {e}")
@@ -2450,7 +2751,7 @@ class Plugin:
                 return
             content = json.dumps(state, indent=2, sort_keys=True) + "\n"
             directory = os.path.dirname(OPTIMIZATION_STATE_PATH)
-            if needs_privilege_escalation(OPTIMIZATION_STATE_PATH):
+            if self._route_path_via_host(OPTIMIZATION_STATE_PATH) or needs_privilege_escalation(OPTIMIZATION_STATE_PATH):
                 if directory:
                     self._run_command(["mkdir", "-p", directory], use_sudo=True)
                 self._write_file(OPTIMIZATION_STATE_PATH, content, use_sudo=True)
@@ -2466,6 +2767,16 @@ class Plugin:
         value = state.pop(key, None)
         self._write_optimization_state(state)
         return value
+
+    def _system_write_access_available(self) -> bool:
+        if os.geteuid() == 0:
+            return True
+        return self._has_noninteractive_sudo()
+
+    def _optimization_runtime_details(self) -> str:
+        if self._system_write_access_available():
+            return ""
+        return "System writes require root or passwordless sudo; the current Decky backend cannot elevate non-interactively"
 
     def _get_fps_presets(self) -> list[int]:
         presets = list(FPS_NATIVE_PRESET_VALUES)
@@ -2515,16 +2826,14 @@ class Plugin:
         return ""
 
     def _service_exists(self, service: str) -> bool:
-        if os.path.exists(f"/etc/systemd/system/{service}") or os.path.exists(f"/usr/lib/systemd/system/{service}"):
+        if self._host_file_exists(f"/etc/systemd/system/{service}") or self._host_file_exists(f"/usr/lib/systemd/system/{service}"):
             return True
 
         try:
-            result = subprocess.run(
+            result = self.runtime.run(
                 ["systemctl", "list-unit-files", service, "--no-legend"],
-                capture_output=True,
-                text=True,
                 timeout=5,
-                env=sanitized_system_env(),
+                env=self.runtime.host_env(),
             )
             return result.returncode == 0 and service in result.stdout
         except Exception:
@@ -2532,12 +2841,10 @@ class Plugin:
 
     def _service_enabled(self, service: str) -> bool:
         try:
-            result = subprocess.run(
+            result = self.runtime.run(
                 ["systemctl", "is-enabled", service],
-                capture_output=True,
-                text=True,
                 timeout=DEFAULT_COMMAND_TIMEOUT,
-                env=sanitized_system_env(),
+                env=self.runtime.host_env(),
             )
             return result.returncode == 0 and result.stdout.strip() == "enabled"
         except Exception:
@@ -2545,24 +2852,20 @@ class Plugin:
 
     def _service_active(self, service: str) -> bool:
         try:
-            result = subprocess.run(
+            result = self.runtime.run(
                 ["systemctl", "is-active", service],
-                capture_output=True,
-                text=True,
                 timeout=DEFAULT_COMMAND_TIMEOUT,
-                env=sanitized_system_env(),
+                env=self.runtime.host_env(),
             )
             return result.returncode == 0 and result.stdout.strip() == "active"
         except Exception:
             return False
 
     def _read_sysctl(self, key: str) -> str:
-        result = subprocess.run(
+        result = self.runtime.run(
             ["sysctl", "-n", key],
-            capture_output=True,
-            text=True,
             timeout=DEFAULT_COMMAND_TIMEOUT,
-            env=sanitized_system_env(),
+            env=self.runtime.host_env(),
         )
         if result.returncode != 0:
             return ""
@@ -2573,20 +2876,18 @@ class Plugin:
 
     def _file_contains_all(self, path: str, needles: list[str]) -> bool:
         try:
-            if not os.path.exists(path):
+            if not self._host_file_exists(path):
                 return False
-            with open(path, "r") as f:
-                contents = f.read()
+            contents = self._read_text_file(path, "")
             return all(needle in contents for needle in needles)
         except Exception:
             return False
 
     def _file_contains_any(self, path: str, needles: list[str]) -> bool:
         try:
-            if not os.path.exists(path):
+            if not self._host_file_exists(path):
                 return False
-            with open(path, "r") as f:
-                contents = f.read()
+            contents = self._read_text_file(path, "")
             return any(needle in contents for needle in needles)
         except Exception:
             return False
@@ -2719,12 +3020,11 @@ class Plugin:
         return isinstance(data, dict) and data.get("was_configured", False)
 
     def _update_grub_param(self, param: str, enabled: bool) -> str:
-        if not os.path.exists(GRUB_DEFAULT_PATH):
+        if not self._host_file_exists(GRUB_DEFAULT_PATH):
             return "GRUB config not found"
 
         try:
-            with open(GRUB_DEFAULT_PATH, "r") as f:
-                contents = f.read()
+            contents = self._read_text_file(GRUB_DEFAULT_PATH, "")
 
             lines = []
             changed = False
@@ -2745,8 +3045,9 @@ class Plugin:
             if not changed and enabled:
                 lines.append(f'GRUB_CMDLINE_LINUX_DEFAULT="{param}"')
 
-            with open(GRUB_DEFAULT_PATH, "w") as f:
-                f.write("\n".join(lines) + "\n")
+            success, error = self._write_file(GRUB_DEFAULT_PATH, "\n".join(lines) + "\n", use_sudo=True)
+            if not success:
+                return error
 
             self._refresh_atomic_manifest()
 
@@ -2799,6 +3100,7 @@ class Plugin:
         }
 
     def _get_lavd_state(self) -> dict:
+        runtime_details = self._optimization_runtime_details()
         configured = self._file_contains_all(
             SCX_DEFAULT_PATH,
             ['SCX_SCHEDULER="scx_lavd"', 'SCX_FLAGS="--performance"'],
@@ -2815,11 +3117,12 @@ class Plugin:
             enabled,
             service_active,
             available=self._command_exists("systemctl") and self._service_exists("scx.service"),
-            details="SteamOS scx.service" if self._service_exists("scx.service") else "scx.service unavailable",
+            details=("SteamOS scx.service" if self._service_exists("scx.service") else "scx.service unavailable") + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Touches a system service.",
         )
 
     def _get_swap_protect_state(self) -> dict:
+        runtime_details = self._optimization_runtime_details()
         configured = self._file_contains_all(
             MEMORY_SYSCTL_PATH,
             ["vm.swappiness = 10", "vm.min_free_kbytes = 524288", "vm.dirty_ratio = 5"],
@@ -2840,11 +3143,12 @@ class Plugin:
             runtime,
             available=self._command_exists("sysctl"),
             needs_reboot=(enabled and not runtime) or (not enabled and runtime),
-            details="swappiness 10, min_free_kbytes 524288, dirty_ratio 5",
+            details="swappiness 10, min_free_kbytes 524288, dirty_ratio 5" + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Runtime sysctl values may remain until they are reloaded.",
         )
 
     def _get_thp_madvise_state(self) -> dict:
+        runtime_details = self._optimization_runtime_details()
         configured = self._file_contains_all(THP_TMPFILES_PATH, ["madvise"])
         atomic = self._atomic_manifest_contains([THP_TMPFILES_PATH])
         enabled = configured and atomic
@@ -2858,11 +3162,12 @@ class Plugin:
             runtime,
             available=os.path.exists(THP_ENABLED_PATH),
             needs_reboot=(enabled and not runtime) or (not enabled and runtime),
-            details="Transparent Huge Pages mode: madvise",
+            details="Transparent Huge Pages mode: madvise" + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Some games prefer different THP behavior.",
         )
 
     def _get_npu_blacklist_state(self) -> dict:
+        runtime_details = self._optimization_runtime_details()
         configured = self._file_contains_all(NPU_BLACKLIST_PATH, ["blacklist amdxdna"])
         atomic = self._atomic_manifest_contains([NPU_BLACKLIST_PATH])
         enabled = configured and atomic
@@ -2877,12 +3182,13 @@ class Plugin:
             enabled and not module_loaded,
             available=self._is_amd_platform() and (npu_present or configured),
             needs_reboot=enabled and module_loaded,
-            details="Module: amdxdna",
+            details="Module: amdxdna" + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Requires reboot when the module is already loaded.",
         )
 
     def _get_usb_wake_state(self) -> dict:
-        service_configured = os.path.exists(USB_WAKE_SERVICE_PATH)
+        runtime_details = self._optimization_runtime_details()
+        service_configured = self._host_file_exists(USB_WAKE_SERVICE_PATH)
         atomic = self._atomic_manifest_contains([USB_WAKE_SERVICE_PATH])
         service_enabled = self._service_enabled("xbox-companion-disable-usb-wake.service")
         service_active = self._service_active("xbox-companion-disable-usb-wake.service")
@@ -2895,11 +3201,12 @@ class Plugin:
             enabled,
             service_active,
             available=self._usb_wake_control_available(),
-            details="Uses /proc/acpi/wakeup through a systemd service",
+            details="Uses /proc/acpi/wakeup through a systemd service" + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Touches a system service.",
         )
 
     def _get_kernel_param_state(self, key: str, option: dict) -> dict:
+        runtime_details = self._optimization_runtime_details()
         param = option["param"]
         configured = self._grub_param_configured(param)
         atomic = self._atomic_manifest_contains([GRUB_DEFAULT_PATH])
@@ -2912,9 +3219,9 @@ class Plugin:
             option["description"],
             enabled,
             active,
-            available=os.path.exists(GRUB_DEFAULT_PATH) and self._is_amd_platform(),
+            available=self._host_file_exists(GRUB_DEFAULT_PATH) and self._is_amd_platform(),
             needs_reboot=(enabled and not active) or (not enabled and active),
-            details=option["details"],
+            details=option["details"] + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Modifies boot configuration and requires reboot to become active.",
         )
 
@@ -2987,6 +3294,11 @@ class Plugin:
             if not support.get("supported", False):
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
                 self._debug_failure("optimization", "set_enabled", support.get("reason", "Platform is not supported"), {"key": key, "normalized_key": normalized_key, "enabled": enabled})
+                return False
+            if not self._system_write_access_available():
+                message = self._optimization_runtime_details()
+                decky.logger.warning(message)
+                self._debug_failure("optimization", "set_enabled", message, {"key": key, "normalized_key": normalized_key, "enabled": enabled})
                 return False
 
             handlers = self._optimization_handlers()
@@ -3079,13 +3391,12 @@ class Plugin:
             state = self._read_optimization_state()
             if "lavd_previous_content" not in state:
                 previous_content = None
-                if os.path.exists(SCX_DEFAULT_PATH) and not self._file_contains_all(
+                if self._host_file_exists(SCX_DEFAULT_PATH) and not self._file_contains_all(
                     SCX_DEFAULT_PATH,
                     ['SCX_SCHEDULER="scx_lavd"', 'SCX_FLAGS="--performance"'],
                 ):
                     try:
-                        with open(SCX_DEFAULT_PATH, "r") as f:
-                            previous_content = f.read()
+                        previous_content = self._read_text_file(SCX_DEFAULT_PATH, "")
                     except Exception:
                         previous_content = None
                 state["lavd_previous_content"] = previous_content
@@ -3223,7 +3534,7 @@ class Plugin:
             }
 
         if self.steamos_manager is None:
-            self.steamos_manager = SteamOsManagerClient(decky.logger)
+            self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
 
         native_state = self.steamos_manager.get_performance_state()
         available_native = native_state.get("available_native", [])
@@ -3285,7 +3596,7 @@ class Plugin:
                 return False
 
             if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger)
+                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
 
             native_state = self.steamos_manager.get_performance_state()
             if not native_state.get("available", False):
@@ -3339,7 +3650,7 @@ class Plugin:
             }
 
         if self.gamescope_settings is None:
-            self.gamescope_settings = GamescopeSettingsClient(decky.logger)
+            self.gamescope_settings = GamescopeSettingsClient(decky.logger, self.runtime)
 
         return self.gamescope_settings.get_display_sync_state()
 
@@ -3353,7 +3664,7 @@ class Plugin:
                 return False
 
             if self.gamescope_settings is None:
-                self.gamescope_settings = GamescopeSettingsClient(decky.logger)
+                self.gamescope_settings = GamescopeSettingsClient(decky.logger, self.runtime)
 
             if key == "vrr":
                 success, error = self.gamescope_settings.set_vrr_enabled(enabled)
@@ -3393,10 +3704,13 @@ class Plugin:
             }
 
         if self.gamescope_settings is None:
-            self.gamescope_settings = GamescopeSettingsClient(decky.logger)
+            self.gamescope_settings = GamescopeSettingsClient(decky.logger, self.runtime)
 
-        available = self._command_exists("gamescopectl")
+        gamescopectl_info = self._command_info("gamescopectl")
+        available = gamescopectl_info.get("available", False)
         live_value = None
+        gamescopectl_error = ""
+        xprop_error = ""
 
         if available:
             for command in (
@@ -3405,6 +3719,7 @@ class Plugin:
             ):
                 success, output = self._run_command_output(command)
                 if not success:
+                    gamescopectl_error = output
                     continue
                 tokens = [token for token in shlex.split(output) if token.strip()]
                 integers = []
@@ -3417,31 +3732,39 @@ class Plugin:
                     live_value = integers[-1]
                     break
             if live_value is None:
-                ok, atom_value, _error, _atom = self.gamescope_settings.get_fps_limit_state()
+                ok, atom_value, xprop_error, _atom = self.gamescope_settings.get_fps_limit_state()
                 if ok:
                     live_value = atom_value
 
         if live_value is None:
-            ok, atom_value, _error, _atom = self.gamescope_settings.get_fps_limit_state()
+            ok, atom_value, xprop_error, _atom = self.gamescope_settings.get_fps_limit_state()
             if ok:
                 live_value = atom_value
                 available = True
 
         current = 0 if live_value is None else live_value
+        available_for_ui = live_value is not None
+        if live_value is not None:
+            status = "available"
+            details = "Uses live gamescope framerate control"
+        elif available and gamescopectl_error:
+            status = f"gamescopectl unavailable at runtime: {gamescopectl_error}"
+            details = gamescopectl_error
+        elif xprop_error:
+            status = f"gamescope fps properties unavailable: {xprop_error}"
+            details = xprop_error
+        else:
+            status = "gamescopectl or gamescope fps properties are unavailable"
+            details = "Live framerate control is unavailable on this system"
+
         return {
-            "available": available,
+            "available": available_for_ui,
             "current": current,
             "requested": current,
             "is_live": live_value is not None,
             "presets": self._get_fps_presets(),
-            "status": "available" if available else "gamescopectl or gamescope fps properties are unavailable",
-            "details": (
-                "Uses live gamescope framerate control"
-                if live_value is not None
-                else "Live gamescope framerate control is available, but the current limit cannot be read"
-                if available
-                else "Live framerate control is unavailable on this system"
-            ),
+            "status": status,
+            "details": details,
         }
 
     async def set_fps_limit(self, value: int) -> bool:
@@ -3497,7 +3820,7 @@ class Plugin:
             }
 
         if self.steamos_manager is None:
-            self.steamos_manager = SteamOsManagerClient(decky.logger)
+            self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
 
         return self.steamos_manager.get_charge_limit_state()
 
@@ -3511,7 +3834,7 @@ class Plugin:
                 return False
 
             if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger)
+                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
 
             success, error = self.steamos_manager.set_charge_limit_enabled(enabled)
             if not success:
@@ -3540,7 +3863,7 @@ class Plugin:
             }
 
         if self.steamos_manager is None:
-            self.steamos_manager = SteamOsManagerClient(decky.logger)
+            self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
 
         steamos_state = self.steamos_manager.get_smt_state()
         if steamos_state.get("available", False):
@@ -3576,7 +3899,7 @@ class Plugin:
                 return False
 
             if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger)
+                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
 
             steamos_state = self.steamos_manager.get_smt_state()
             if steamos_state.get("available", False):
@@ -3688,7 +4011,7 @@ class Plugin:
 
         try:
             if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger)
+                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
 
             boost_state = self.steamos_manager.get_cpu_boost_state()
             if boost_state.get("available", False):
@@ -3717,7 +4040,7 @@ class Plugin:
                 return False
 
             if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger)
+                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
 
             native_state = self.steamos_manager.get_cpu_boost_state()
             if native_state.get("available", False):
@@ -3751,6 +4074,14 @@ class Plugin:
             decky.logger.error(f"Failed to set CPU boost: {e}")
             self._debug_failure("cpu", "set_boost", f"Failed to set CPU boost: {e}", {"enabled": enabled})
             return False
+
+    def _get_runtime_state(self) -> dict:
+        runtime_state = self.runtime.diagnostics()
+        steamos_bus = "none"
+        if self.steamos_manager is not None:
+            steamos_bus = self.steamos_manager.get_active_bus()
+        runtime_state["steamos_manager_bus"] = steamos_bus
+        return runtime_state
 
     async def get_dashboard_state(self) -> dict:
         performance_modes = await self.get_performance_modes()
@@ -3821,6 +4152,7 @@ class Plugin:
         }
 
         snapshot = {
+            "runtime_backend": self.runtime.execution_backend(),
             "performance_status": profiles.get("status", ""),
             "performance_current": profiles.get("current", ""),
             "cpu_boost_available": cpu.get("boost_available", False),
@@ -3860,5 +4192,6 @@ class Plugin:
             "optimizations": optimizations.get("states", []),
             "hardware_controls": hardware_controls,
             "fps_limit": fps_limit,
+            "runtime": self._get_runtime_state(),
             "debug_log": list(self.debug_log),
         }

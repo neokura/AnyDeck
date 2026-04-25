@@ -310,6 +310,26 @@ interface InformationState {
   optimizations: OptimizationState[];
   hardware_controls: Record<string, boolean>;
   fps_limit: FpsLimitState;
+  runtime: {
+    execution_backend: "direct" | "flatpak-host";
+    os_release_path: string;
+    host_os_id: string;
+    commands: Record<
+      string,
+      {
+        available: boolean;
+        path: string;
+        via_host: boolean;
+      }
+    >;
+    steamos_manager_bus: "user" | "system" | "none";
+    display_env: {
+      display: string;
+      xauthority: string;
+      gamescope_env_path: string;
+      gamescope_wayland_display: string;
+    };
+  };
   debug_log: DebugLogEntry[];
 }
 
@@ -1763,6 +1783,60 @@ const InformationView: VFC<{
                   label="Current TDP"
                   value={formatPositiveMeasurement(data.temperatures.tdp, "W")}
                 />
+              </div>
+            </PanelSectionRow>
+          </PanelSection>
+
+          <PanelSection title="Runtime Diagnostics">
+            <PanelSectionRow>
+              <div style={cardStyle}>
+                <InfoRow
+                  label="Execution"
+                  value={
+                    data.runtime.execution_backend === "flatpak-host"
+                      ? "flatpak-spawn --host"
+                      : "Direct"
+                  }
+                />
+                <InfoRow
+                  label="OS release"
+                  value={data.runtime.os_release_path || "Unknown"}
+                />
+                <InfoRow
+                  label="Host OS ID"
+                  value={data.runtime.host_os_id || "Unknown"}
+                />
+                <InfoRow
+                  label="SteamOS bus"
+                  value={data.runtime.steamos_manager_bus || "none"}
+                />
+                <InfoRow
+                  label="DISPLAY"
+                  value={data.runtime.display_env.display || "Unavailable"}
+                />
+                <InfoRow
+                  label="XAUTHORITY"
+                  value={data.runtime.display_env.xauthority || "Unavailable"}
+                />
+                <InfoRow
+                  label="Gamescope env"
+                  value={data.runtime.display_env.gamescope_env_path || "Unavailable"}
+                />
+                <InfoRow
+                  label="Gamescope wayland"
+                  value={data.runtime.display_env.gamescope_wayland_display || "Unavailable"}
+                />
+                {Object.entries(data.runtime.commands).map(([command, info]) => (
+                  <InfoRow
+                    key={command}
+                    label={command}
+                    value={
+                      info.available
+                        ? `${info.via_host ? "Host" : "Direct"}${info.path ? `: ${info.path}` : ""}`
+                        : "Unavailable"
+                    }
+                  />
+                ))}
               </div>
             </PanelSectionRow>
           </PanelSection>
