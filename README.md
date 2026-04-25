@@ -17,7 +17,7 @@ Current alpha: `0.2.0-alpha.1`
 - Reads and sets live framerate limits through `gamescopectl`.
 - Reads and toggles CPU boost when the kernel exposes the control.
 - Reads and toggles SMT through SteamOS Manager first, then the kernel SMT interface when needed.
-- Reads battery status, health, charge limit, voltage, current, capacity, and available charge timing.
+- Reads battery status, health, charge limit, voltage, current, capacity, and estimated charge or discharge timing when enough live data is available.
 - Reads RGB state from compatible LED sysfs paths and applies preset colors.
 - Shows device, BIOS, kernel, CPU, GPU, memory, temperature, GPU clock, and current TDP information.
 - Offers optional system optimizations as separate end-user controls with visible compatibility and rollback-aware state.
@@ -30,7 +30,7 @@ Open Konsole on the handheld and run:
 bash <(curl -fsSL https://raw.githubusercontent.com/neokura/XboxCompanion/main/install.sh)
 ```
 
-The installer checks for Decky Loader before it touches the plugin directory.
+The installer checks for Decky Loader before it touches the plugin directory. It requires `curl`, `python3`, and `unzip`.
 
 If Decky is missing, the installer stops and offers to open:
 
@@ -40,13 +40,19 @@ https://decky.xyz/
 
 Install Decky first, then rerun the command above.
 
-When Decky is present, the installer downloads the newest published GitHub release zip, including alpha pre-releases, and extracts it to:
+When Decky is present, the installer resolves the newest published GitHub release zip, including alpha pre-releases, validates the Decky plugin layout, and installs it to:
 
 ```text
 $HOME/homebrew/plugins/Xbox Companion
 ```
 
 Then it restarts Decky Loader when possible. Xbox Companion should appear in the Decky quick access menu after the restart.
+
+To install a specific published version instead of the newest one:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/neokura/XboxCompanion/main/install.sh) 0.2.0-alpha.1
+```
 
 ## Supported Platforms
 
@@ -173,7 +179,7 @@ The workflow:
 - installs dependencies with pnpm
 - runs TypeScript type checks
 - runs Python unit tests
-- builds the Decky frontend
+- builds the Decky frontend as part of the packaging step
 - packages a Decky-ready release zip with a top-level `xbox-companion/` directory
 - uploads the zip as a workflow artifact
 - attaches the zip to a GitHub Release when a `v*` tag is pushed
@@ -181,13 +187,15 @@ The workflow:
 
 The release package contains:
 
-- `dist/`
+- `xbox-companion/dist/index.js`
 - `main.py`
 - `plugin.json`
 - `package.json`
 - `README.md`
 - `LICENSE`
 - `icons/`
+
+Source maps are excluded from published release zips.
 
 To publish a tagged alpha:
 
