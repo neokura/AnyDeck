@@ -628,6 +628,87 @@ class PluginPerformanceProfileTest(unittest.TestCase):
         self.assertFalse(state["smt"]["enabled"])
         self.assertEqual(state["fps_limit"]["current"], 40)
 
+    def test_cpu_boost_uses_privileged_write_when_not_root(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch(
+            "main.os.path.exists",
+            side_effect=lambda path: path == main.CPU_BOOST_PATH,
+        ), patch(
+            "main.needs_privilege_escalation",
+            return_value=True,
+        ), patch.object(
+            plugin,
+            "_write_file",
+            return_value=(True, ""),
+        ) as write_file:
+            result = asyncio.run(plugin.set_cpu_boost_enabled(True))
+
+        self.assertTrue(result)
+        write_file.assert_called_once_with(main.CPU_BOOST_PATH, "1", use_sudo=True)
+
+    def test_smt_kernel_fallback_uses_privileged_write_when_not_root(self):
+        plugin = main.Plugin()
+        plugin.steamos_manager = types.SimpleNamespace(
+            get_smt_state=lambda: {
+                "available": False,
+                "enabled": False,
+                "status": "unavailable",
+                "details": "fallback",
+            }
+        )
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch(
+            "main.os.path.exists",
+            side_effect=lambda path: path == main.SMT_CONTROL_PATH,
+        ), patch(
+            "main.needs_privilege_escalation",
+            return_value=True,
+        ), patch.object(
+            plugin,
+            "_write_file",
+            return_value=(True, ""),
+        ) as write_file:
+            result = asyncio.run(plugin.set_smt_enabled(True))
+
+        self.assertTrue(result)
+        write_file.assert_called_once_with(main.SMT_CONTROL_PATH, "on", use_sudo=True)
+
+    def test_swap_protect_runs_sysctl_with_sudo_when_not_root(self):
+        plugin = main.Plugin()
+
+        with patch(
+            "main.needs_privilege_escalation",
+            return_value=True,
+        ), patch.object(
+            plugin,
+            "_read_optimization_state",
+            return_value={},
+        ), patch.object(
+            plugin,
+            "_write_optimization_state",
+            return_value=None,
+        ), patch.object(
+            plugin,
+            "_read_sysctl",
+            return_value="",
+        ), patch.object(
+            plugin,
+            "_write_managed_file",
+            return_value=None,
+        ), patch.object(
+            plugin,
+            "_refresh_atomic_manifest",
+            return_value=None,
+        ), patch.object(
+            plugin,
+            "_run_optional_command",
+            return_value="",
+        ) as run_optional:
+            plugin._set_swap_protect_enabled(True)
+
+        run_optional.assert_called_once_with(["sysctl", "--system"], use_sudo=True)
+
     def test_fps_presets_use_native_modes_without_high_refresh_by_default(self):
         plugin = main.Plugin()
         plugin.settings = {"fps_limit": 0}

@@ -265,6 +265,24 @@ def sanitized_system_env(overrides: dict | None = None) -> dict:
         env.update(overrides)
     return env
 
+
+SYSTEM_PROTECTED_PREFIXES = (
+    "/etc/",
+    "/proc/",
+    "/sys/",
+    "/usr/lib/systemd/",
+    "/var/lib/",
+)
+
+
+def needs_privilege_escalation(path: str | None = None) -> bool:
+    if os.geteuid() == 0:
+        return False
+    if path is None:
+        return True
+    normalized = os.path.abspath(path)
+    return normalized.startswith(SYSTEM_PROTECTED_PREFIXES)
+
 class SteamOsManagerClient:
     """Small DBus client for SteamOS Manager via busctl."""
 
@@ -2085,7 +2103,16 @@ class Plugin:
         return shutil.which(cmd) is not None
 
     def _write_managed_file(self, path: str, content: str, mode: int | None = None):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        directory = os.path.dirname(path)
+        if needs_privilege_escalation(path):
+            if directory:
+                self._run_command(["mkdir", "-p", directory], use_sudo=True)
+            self._write_file(path, content, use_sudo=True)
+            if mode is not None:
+                self._run_command(["chmod", f"{mode:o}", path], use_sudo=True)
+            return
+
+        os.makedirs(directory, exist_ok=True)
         with open(path, "w") as f:
             f.write(content)
         if mode is not None:
@@ -2094,7 +2121,10 @@ class Plugin:
     def _remove_file(self, path: str):
         try:
             if os.path.exists(path):
-                os.remove(path)
+                if needs_privilege_escalation(path):
+                    self._run_command(["rm", "-f", path], use_sudo=True)
+                else:
+                    os.remove(path)
         except Exception as e:
             decky.logger.warning(f"Failed to remove {path}: {e}")
 
@@ -2156,15 +2186,21 @@ class Plugin:
                 skipped_files.append(path)
                 return
 
-            os.remove(path)
+            if needs_privilege_escalation(OPTIMIZATION_STATE_PATH):
+                success, error = self._run_command(["rm", "-f", path], use_sudo=True)
+                if not success:
+                    raise RuntimeError(error)
+            else:
+                os.remove(path)
             removed_files.append(path)
         except Exception as e:
             errors.append(f"{path}: {e}")
 
-    def _run_command(self, command: list[str]) -> tuple[bool, str]:
+    def _run_command(self, command: list[str], use_sudo: bool = False) -> tuple[bool, str]:
         try:
+            final_command = ["sudo", *command] if use_sudo and needs_privilege_escalation() else command
             result = subprocess.run(
-                command,
+                final_command,
                 capture_output=True,
                 text=True,
                 timeout=20,
@@ -2174,6 +2210,33 @@ class Plugin:
             return False, f"{command[0]} is not installed"
         except subprocess.TimeoutExpired:
             return False, f"{command[0]} timed out"
+        except Exception as e:
+            return False, str(e)
+
+        if result.returncode != 0:
+            return False, result.stderr.strip() or result.stdout.strip()
+
+        return True, ""
+
+    def _write_file(self, path: str, content: str, use_sudo: bool = False) -> tuple[bool, str]:
+        try:
+            if use_sudo and needs_privilege_escalation(path):
+                result = subprocess.run(
+                    ["sudo", "tee", path],
+                    input=content,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    env=sanitized_system_env(),
+                )
+            else:
+                with open(path, "w") as f:
+                    f.write(content)
+                return True, ""
+        except FileNotFoundError:
+            return False, "tee is not installed"
+        except subprocess.TimeoutExpired:
+            return False, "file write timed out"
         except Exception as e:
             return False, str(e)
 
@@ -2203,8 +2266,8 @@ class Plugin:
 
         return True, result.stdout.strip()
 
-    def _run_optional_command(self, command: list[str]) -> str:
-        success, error = self._run_command(command)
+    def _run_optional_command(self, command: list[str], use_sudo: bool = False) -> str:
+        success, error = self._run_command(command, use_sudo=use_sudo)
         if not success:
             decky.logger.warning(f"Optional command failed: {' '.join(command)}: {error}")
             return error
@@ -2226,10 +2289,16 @@ class Plugin:
             if not state:
                 self._remove_file(OPTIMIZATION_STATE_PATH)
                 return
-            os.makedirs(os.path.dirname(OPTIMIZATION_STATE_PATH), exist_ok=True)
+            content = json.dumps(state, indent=2, sort_keys=True) + "\n"
+            directory = os.path.dirname(OPTIMIZATION_STATE_PATH)
+            if needs_privilege_escalation(OPTIMIZATION_STATE_PATH):
+                if directory:
+                    self._run_command(["mkdir", "-p", directory], use_sudo=True)
+                self._write_file(OPTIMIZATION_STATE_PATH, content, use_sudo=True)
+                return
+            os.makedirs(directory, exist_ok=True)
             with open(OPTIMIZATION_STATE_PATH, "w") as f:
-                json.dump(state, f, indent=2, sort_keys=True)
-                f.write("\n")
+                f.write(content)
         except Exception as e:
             decky.logger.warning(f"Failed to write optimization state: {e}")
 
@@ -2280,7 +2349,11 @@ class Plugin:
         return sorted(refresh_rates)
 
     def _systemctl(self, *args: str) -> str:
-        return self._run_optional_command(["systemctl", *args])
+        success, error = self._run_command(["systemctl", *args], use_sudo=True)
+        if not success:
+            decky.logger.warning(f"Optional command failed: systemctl {' '.join(args)}: {error}")
+            return error
+        return ""
 
     def _service_exists(self, service: str) -> bool:
         if os.path.exists(f"/etc/systemd/system/{service}") or os.path.exists(f"/usr/lib/systemd/system/{service}"):
@@ -2337,7 +2410,7 @@ class Plugin:
         return result.stdout.strip()
 
     def _write_sysctl(self, key: str, value: str):
-        self._run_optional_command(["sysctl", "-w", f"{key}={value}"])
+        self._run_command(["sysctl", "-w", f"{key}={value}"], use_sudo=True)
 
     def _file_contains_all(self, path: str, needles: list[str]) -> bool:
         try:
@@ -2407,8 +2480,13 @@ class Plugin:
     def _set_acpi_wake_devices(self, devices: list[str]):
         for device in devices:
             try:
-                with open(ACPI_WAKEUP_PATH, "w") as f:
-                    f.write(device)
+                success, error = self._write_file(
+                    ACPI_WAKEUP_PATH,
+                    device,
+                    use_sudo=True,
+                )
+                if not success:
+                    raise RuntimeError(error)
             except Exception as e:
                 decky.logger.warning(f"Failed to restore ACPI wake device {device}: {e}")
 
@@ -2437,8 +2515,9 @@ class Plugin:
         if not mode:
             return
         try:
-            with open(THP_ENABLED_PATH, "w") as f:
-                f.write(mode)
+            success, error = self._write_file(THP_ENABLED_PATH, mode, use_sudo=True)
+            if not success:
+                raise RuntimeError(error)
         except Exception as e:
             decky.logger.warning(f"Failed to set THP mode {mode}: {e}")
 
@@ -2513,7 +2592,11 @@ class Plugin:
             self._refresh_atomic_manifest()
 
             if self._command_exists("update-grub"):
-                return self._run_optional_command(["update-grub"])
+                success, error = self._run_command(["update-grub"], use_sudo=True)
+                if not success:
+                    decky.logger.warning(f"Optional command failed: update-grub: {error}")
+                    return error
+                return ""
             return "update-grub is not installed"
         except Exception as e:
             return str(e)
@@ -2872,7 +2955,7 @@ class Plugin:
             self._write_optimization_state(state)
             self._write_managed_file(MEMORY_SYSCTL_PATH, MEMORY_SYSCTL_CONTENT)
             self._refresh_atomic_manifest()
-            self._run_optional_command(["sysctl", "--system"])
+            self._run_optional_command(["sysctl", "--system"], use_sudo=True)
         else:
             self._remove_file(MEMORY_SYSCTL_PATH)
             self._refresh_atomic_manifest()
@@ -2882,7 +2965,7 @@ class Plugin:
                     if value:
                         self._write_sysctl(key, str(value))
             else:
-                self._run_optional_command(["sysctl", "--system"])
+                self._run_optional_command(["sysctl", "--system"], use_sudo=True)
 
     def _set_thp_madvise_enabled(self, enabled: bool):
         if enabled:
@@ -2891,7 +2974,7 @@ class Plugin:
             self._write_optimization_state(state)
             self._write_managed_file(THP_TMPFILES_PATH, THP_TMPFILES_CONTENT)
             self._refresh_atomic_manifest()
-            self._run_optional_command(["systemd-tmpfiles", "--create", THP_TMPFILES_PATH])
+            self._run_optional_command(["systemd-tmpfiles", "--create", THP_TMPFILES_PATH], use_sudo=True)
         else:
             self._remove_file(THP_TMPFILES_PATH)
             self._refresh_atomic_manifest()
@@ -2899,7 +2982,7 @@ class Plugin:
             if isinstance(previous_mode, str) and previous_mode:
                 self._write_thp_mode(previous_mode)
             else:
-                self._run_optional_command(["systemd-tmpfiles", "--create"])
+                self._run_optional_command(["systemd-tmpfiles", "--create"], use_sudo=True)
 
     def _set_npu_blacklist_enabled(self, enabled: bool):
         if enabled and not (self._is_amd_platform() and self._amd_npu_present()):
@@ -2949,7 +3032,7 @@ class Plugin:
         if was_configured:
             self._refresh_atomic_manifest()
             if self._command_exists("update-grub"):
-                self._run_optional_command(["update-grub"])
+                self._run_optional_command(["update-grub"], use_sudo=True)
             return
 
         self._update_grub_param(param, False)
@@ -3305,8 +3388,14 @@ class Plugin:
                     decky.logger.warning(f"Failed to set SteamOS SMT: {error}")
                     return False
             elif os.path.exists(SMT_CONTROL_PATH):
-                with open(SMT_CONTROL_PATH, "w") as f:
-                    f.write("on" if enabled else "off")
+                success, error = self._write_file(
+                    SMT_CONTROL_PATH,
+                    "on" if enabled else "off",
+                    use_sudo=True,
+                )
+                if not success:
+                    decky.logger.warning(f"Failed to set kernel SMT state: {error}")
+                    return False
             else:
                 decky.logger.warning("SMT control unavailable")
                 return False
@@ -3417,8 +3506,10 @@ class Plugin:
                 return False
             
             value = "1" if enabled else "0"
-            with open(CPU_BOOST_PATH, 'w') as f:
-                f.write(value)
+            success, error = self._write_file(CPU_BOOST_PATH, value, use_sudo=True)
+            if not success:
+                decky.logger.warning(f"Failed to set CPU boost: {error}")
+                return False
             
             decky.logger.info(f"CPU boost {'enabled' if enabled else 'disabled'}")
             return True
