@@ -80,6 +80,20 @@ class SteamOsManagerClientTest(unittest.TestCase):
 
     def test_reads_native_performance_state(self):
         def fake_run(cmd, **_kwargs):
+            if "introspect" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "\n".join(
+                        [
+                            "com.steampowered.SteamOSManager1.PerformanceProfile1 interface - -",
+                            "AvailablePerformanceProfiles property as 3 emits-change",
+                            "PerformanceProfile property s - emits-change",
+                            "SuggestedDefaultPerformanceProfile property s - emits-change",
+                        ]
+                    ),
+                    "",
+                )
             prop = cmd[-1]
             if prop == "AvailablePerformanceProfiles":
                 return subprocess.CompletedProcess(
@@ -118,15 +132,18 @@ class SteamOsManagerClientTest(unittest.TestCase):
         self.assertEqual(state["available_native"], [])
         self.assertIn("SteamOS native profiles unavailable", state["status"])
 
-    def test_discovers_performance_interface_via_introspection(self):
+    def test_uses_user_bus_with_explicit_session_bus_address(self):
+        calls = []
+
         def fake_run(cmd, **_kwargs):
+            calls.append((cmd, _kwargs))
             if "introspect" in cmd:
                 return subprocess.CompletedProcess(
                     cmd,
                     0,
                     "\n".join(
                         [
-                            "com.steampowered.SteamOSManager1 interface - -",
+                            "com.steampowered.SteamOSManager1.PerformanceProfile1 interface - -",
                             "AvailablePerformanceProfiles property as 3 emits-change",
                             "PerformanceProfile property s - emits-change",
                             "SuggestedDefaultPerformanceProfile property s - emits-change",
@@ -154,12 +171,25 @@ class SteamOsManagerClientTest(unittest.TestCase):
 
         self.assertTrue(state["available"])
         self.assertEqual(state["current"], "balanced")
+        first_cmd, first_kwargs = calls[0]
+        self.assertIn("--user", first_cmd)
+        env = first_kwargs.get("env", {})
+        self.assertTrue(env.get("DBUS_SESSION_BUS_ADDRESS", "").startswith("unix:path="))
+        self.assertTrue(env.get("XDG_RUNTIME_DIR", "").startswith("/run/user/"))
 
     def test_sets_native_performance_profile(self):
         calls = []
 
         def fake_run(cmd, **_kwargs):
             calls.append(cmd)
+            if "introspect" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "com.steampowered.SteamOSManager1.PerformanceProfile1 interface - -\n"
+                    "PerformanceProfile property s - emits-change\n",
+                    "",
+                )
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         with patch("main.subprocess.run", side_effect=fake_run):
@@ -174,8 +204,23 @@ class SteamOsManagerClientTest(unittest.TestCase):
 
     def test_reads_steamos_charge_limit_state(self):
         def fake_run(cmd, **_kwargs):
-            if "get-property" in cmd and cmd[-1] == "ChargeLimit":
-                return subprocess.CompletedProcess(cmd, 0, "u 80\n", "")
+            if "introspect" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "\n".join(
+                        [
+                            "com.steampowered.SteamOSManager1.BatteryChargeLimit1 interface - -",
+                            "MaxChargeLevel property i - emits-change",
+                            "SuggestedMinimumLimit property i - emits-change",
+                        ]
+                    ),
+                    "",
+                )
+            if "get-property" in cmd and cmd[-1] == "MaxChargeLevel":
+                return subprocess.CompletedProcess(cmd, 0, "i 80\n", "")
+            if "get-property" in cmd and cmd[-1] == "SuggestedMinimumLimit":
+                return subprocess.CompletedProcess(cmd, 0, "i 30\n", "")
             return subprocess.CompletedProcess(cmd, 1, "", "unknown property")
 
         with patch("main.subprocess.run", side_effect=fake_run):
@@ -185,14 +230,21 @@ class SteamOsManagerClientTest(unittest.TestCase):
         self.assertTrue(state["available"])
         self.assertTrue(state["enabled"])
         self.assertEqual(state["limit"], 80)
+        self.assertEqual(state["suggested_minimum"], 30)
 
-    def test_sets_steamos_charge_limit_to_80_or_100(self):
+    def test_sets_steamos_charge_limit_to_80_or_reset_default(self):
         calls = []
 
         def fake_run(cmd, **_kwargs):
             calls.append(cmd)
-            if "get-property" in cmd and cmd[-1] == "ChargeLimit":
-                return subprocess.CompletedProcess(cmd, 0, "u 100\n", "")
+            if "introspect" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "com.steampowered.SteamOSManager1.BatteryChargeLimit1 interface - -\n"
+                    "MaxChargeLevel property i - emits-change\n",
+                    "",
+                )
             if "set-property" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             return subprocess.CompletedProcess(cmd, 1, "", "unknown property")
@@ -208,44 +260,65 @@ class SteamOsManagerClientTest(unittest.TestCase):
         self.assertEqual(disabled_error, "")
         set_calls = [call for call in calls if "set-property" in call]
         self.assertEqual(set_calls[0][-1], "80")
-        self.assertEqual(set_calls[1][-1], "100")
+        self.assertEqual(set_calls[1][-1], "-1")
 
-    def test_reads_steamos_smt_state(self):
+    def test_reads_steamos_cpu_boost_state(self):
         def fake_run(cmd, **_kwargs):
-            if "get-property" in cmd and cmd[-1] == "SMT":
-                return subprocess.CompletedProcess(cmd, 0, "b true\n", "")
+            if "introspect" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "com.steampowered.SteamOSManager1.CpuBoost1 interface - -\n"
+                    "CpuBoostState property u - emits-change\n",
+                    "",
+                )
+            if "get-property" in cmd and cmd[-1] == "CpuBoostState":
+                return subprocess.CompletedProcess(cmd, 0, "u 1\n", "")
             return subprocess.CompletedProcess(cmd, 1, "", "unknown property")
 
         with patch("main.subprocess.run", side_effect=fake_run):
             client = main.SteamOsManagerClient(FakeLogger())
-            state = client.get_smt_state()
+            state = client.get_cpu_boost_state()
 
         self.assertTrue(state["available"])
         self.assertTrue(state["enabled"])
 
-    def test_sets_steamos_smt_state(self):
+    def test_sets_steamos_cpu_boost_state(self):
         calls = []
 
         def fake_run(cmd, **_kwargs):
             calls.append(cmd)
-            if "get-property" in cmd and cmd[-1] == "SMT":
-                return subprocess.CompletedProcess(cmd, 0, "b true\n", "")
+            if "introspect" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "com.steampowered.SteamOSManager1.CpuBoost1 interface - -\n"
+                    "CpuBoostState property u - emits-change\n",
+                    "",
+                )
             if "set-property" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             return subprocess.CompletedProcess(cmd, 1, "", "unknown property")
 
         with patch("main.subprocess.run", side_effect=fake_run):
             client = main.SteamOsManagerClient(FakeLogger())
-            enabled, enabled_error = client.set_smt_enabled(True)
-            disabled, disabled_error = client.set_smt_enabled(False)
+            enabled, enabled_error = client.set_cpu_boost_enabled(True)
+            disabled, disabled_error = client.set_cpu_boost_enabled(False)
 
         self.assertTrue(enabled)
         self.assertEqual(enabled_error, "")
         self.assertTrue(disabled)
         self.assertEqual(disabled_error, "")
         set_calls = [call for call in calls if "set-property" in call]
-        self.assertEqual(set_calls[0][-1], "true")
-        self.assertEqual(set_calls[1][-1], "false")
+        self.assertEqual(set_calls[0][-1], "1")
+        self.assertEqual(set_calls[1][-1], "0")
+
+    def test_reports_smt_as_not_exposed_by_steamos_manager(self):
+        client = main.SteamOsManagerClient(FakeLogger())
+        state = client.get_smt_state()
+
+        self.assertFalse(state["available"])
+        self.assertIn("does not expose", state["details"])
 
 
 class GamescopeSettingsClientTest(unittest.TestCase):

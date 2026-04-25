@@ -46,41 +46,12 @@ PLUGIN_NAME = "Xbox Companion"
 STEAMOS_MANAGER_SERVICE = "com.steampowered.SteamOSManager1"
 STEAMOS_MANAGER_OBJECT = "/com/steampowered/SteamOSManager1"
 STEAMOS_PERFORMANCE_INTERFACE = "com.steampowered.SteamOSManager1.PerformanceProfile1"
-STEAMOS_PERFORMANCE_INTERFACES = [
-    "com.steampowered.SteamOSManager1.PerformanceProfile1",
-    "com.steampowered.SteamOSManager1",
-    "com.steampowered.SteamOSManager1.PowerManagement1",
-]
+STEAMOS_MANAGER_INTERFACE = "com.steampowered.SteamOSManager1.Manager2"
+STEAMOS_CHARGE_LIMIT_INTERFACE = "com.steampowered.SteamOSManager1.BatteryChargeLimit1"
+STEAMOS_CPU_BOOST_INTERFACE = "com.steampowered.SteamOSManager1.CpuBoost1"
 STEAMOS_CHARGE_LIMIT_PERCENT = 80
 STEAMOS_CHARGE_FULL_PERCENT = 100
-STEAMOS_CHARGE_LIMIT_INTERFACES = [
-    "com.steampowered.SteamOSManager1",
-    "com.steampowered.SteamOSManager1.BatteryChargeLimit1",
-    "com.steampowered.SteamOSManager1.Battery1",
-    "com.steampowered.SteamOSManager1.PowerManagement1",
-    "com.steampowered.SteamOSManager1.Power1",
-]
-STEAMOS_CHARGE_LIMIT_PROPERTIES = [
-    "ChargeLimit",
-    "BatteryChargeLimit",
-    "ChargeControlEndThreshold",
-    "MaxChargeLevel",
-    "ChargeLimitPercent",
-    "ChargeLimitEnabled",
-]
-STEAMOS_SMT_INTERFACES = [
-    "com.steampowered.SteamOSManager1",
-    "com.steampowered.SteamOSManager1.PerformanceProfile1",
-    "com.steampowered.SteamOSManager1.PowerManagement1",
-    "com.steampowered.SteamOSManager1.Cpu1",
-]
-STEAMOS_SMT_PROPERTIES = [
-    "SMT",
-    "Smt",
-    "SmtEnabled",
-    "SMTEnabled",
-    "CpuSmtEnabled",
-]
+STEAMOS_CHARGE_LIMIT_RESET = -1
 
 GAMESCOPE_VRR_CAPABLE_ATOM = "GAMESCOPE_VRR_CAPABLE"
 GAMESCOPE_VRR_ENABLED_ATOM = "GAMESCOPE_VRR_ENABLED"
@@ -288,14 +259,29 @@ class SteamOsManagerClient:
 
     def __init__(self, logger):
         self.logger = logger
+        self.user_bus_env = self._build_user_bus_env()
+
+    def _build_user_bus_env(self) -> dict:
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if not runtime_dir:
+            runtime_dir = f"/run/user/{os.getuid()}"
+        address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+        if not address:
+            address = f"unix:path={runtime_dir}/bus"
+        return sanitized_system_env(
+            {
+                "XDG_RUNTIME_DIR": runtime_dir,
+                "DBUS_SESSION_BUS_ADDRESS": address,
+            }
+        )
 
     def _run_busctl(self, args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["busctl", "--system", *args],
+            ["busctl", "--user", *args],
             capture_output=True,
             text=True,
             timeout=5,
-            env=sanitized_system_env(),
+            env=self.user_bus_env,
         )
 
     def _introspect_interfaces(self) -> dict[str, set[str]]:
@@ -328,24 +314,11 @@ class SteamOsManagerClient:
                 interfaces.setdefault(current_interface, set()).add(parts[0])
         return interfaces
 
-    def _discover_property_interface(
-        self,
-        candidate_interfaces: list[str],
-        candidate_properties: list[str],
-    ) -> tuple[str, str]:
-        interfaces = self._introspect_interfaces()
-        for interface in candidate_interfaces:
-            properties = interfaces.get(interface, set())
-            for prop in candidate_properties:
-                if prop in properties:
-                    return interface, prop
+    def _get_available_properties(self, interface: str) -> set[str]:
+        return self._introspect_interfaces().get(interface, set())
 
-        for interface, properties in interfaces.items():
-            for prop in candidate_properties:
-                if prop in properties:
-                    return interface, prop
-
-        return "", ""
+    def _has_property(self, interface: str, prop: str) -> bool:
+        return prop in self._get_available_properties(interface)
 
     def _get_property(
         self,
@@ -430,65 +403,40 @@ class SteamOsManagerClient:
         return tokens[1:]
 
     def get_performance_state(self) -> dict:
-        performance_interface, available_prop = self._discover_property_interface(
-            STEAMOS_PERFORMANCE_INTERFACES,
-            [
-                "AvailablePerformanceProfiles",
-                "AvailableProfiles",
-            ],
-        )
-        if not performance_interface:
-            performance_interface = STEAMOS_PERFORMANCE_INTERFACE
+        properties = self._get_available_properties(STEAMOS_PERFORMANCE_INTERFACE)
+        if "AvailablePerformanceProfiles" not in properties:
+            return {
+                "available": False,
+                "available_native": [],
+                "current": "",
+                "suggested_default": "",
+                "status": (
+                    "SteamOS native profiles unavailable: "
+                    "PerformanceProfile1 is not exposed on the SteamOS Manager user bus"
+                ),
+            }
+
         available_ok, available_output, available_error = self._get_property(
-            available_prop or "AvailablePerformanceProfiles",
-            performance_interface,
+            "AvailablePerformanceProfiles",
+            STEAMOS_PERFORMANCE_INTERFACE,
         )
-        if not available_ok:
-            for interface in STEAMOS_PERFORMANCE_INTERFACES:
-                for prop in ("AvailablePerformanceProfiles", "AvailableProfiles"):
-                    available_ok, available_output, available_error = self._get_property(prop, interface)
-                    if available_ok:
-                        performance_interface = interface
-                        available_prop = prop
-                        break
-                if available_ok:
-                    break
         if not available_ok:
             return {
                 "available": False,
                 "available_native": [],
                 "current": "",
                 "suggested_default": "",
-                "status": f"SteamOS native profiles unavailable: {available_error}"
+                "status": f"SteamOS native profiles unavailable: {available_error}",
             }
-
         available_native = self._parse_busctl_string_array(available_output)
-
-        current_prop = "PerformanceProfile"
-        if performance_interface:
-            current_interface, discovered_current = self._discover_property_interface(
-                [performance_interface],
-                ["PerformanceProfile", "CurrentPerformanceProfile"],
-            )
-            if current_interface:
-                performance_interface = current_interface
-            if discovered_current:
-                current_prop = discovered_current
-
         current_ok, current_output, current_error = self._get_property(
-            current_prop,
-            performance_interface,
+            "PerformanceProfile",
+            STEAMOS_PERFORMANCE_INTERFACE,
         )
         current = self._parse_busctl_string(current_output) if current_ok else ""
-
-        suggested_prop = "SuggestedDefaultPerformanceProfile"
-        suggested_interface, discovered_suggested = self._discover_property_interface(
-            [performance_interface],
-            ["SuggestedDefaultPerformanceProfile", "DefaultPerformanceProfile"],
-        )
         suggested_ok, suggested_output, _ = self._get_property(
-            discovered_suggested or suggested_prop,
-            suggested_interface or performance_interface,
+            "SuggestedDefaultPerformanceProfile",
+            STEAMOS_PERFORMANCE_INTERFACE,
         )
         suggested_default = (
             self._parse_busctl_string(suggested_output)
@@ -509,123 +457,112 @@ class SteamOsManagerClient:
 
     def set_performance_profile(self, profile_id: str) -> tuple[bool, str]:
         try:
-            performance_interface, current_prop = self._discover_property_interface(
-                STEAMOS_PERFORMANCE_INTERFACES,
-                ["PerformanceProfile", "CurrentPerformanceProfile"],
+            if not self._has_property(STEAMOS_PERFORMANCE_INTERFACE, "PerformanceProfile"):
+                return False, "SteamOS Manager PerformanceProfile1 interface is unavailable on the user bus"
+            return self._set_property(
+                STEAMOS_PERFORMANCE_INTERFACE,
+                "PerformanceProfile",
+                "s",
+                profile_id,
             )
-            interfaces_to_try = [performance_interface] if performance_interface else []
-            interfaces_to_try.extend(
-                interface for interface in STEAMOS_PERFORMANCE_INTERFACES if interface not in interfaces_to_try
-            )
-            props_to_try = [current_prop] if current_prop else []
-            props_to_try.extend(
-                prop for prop in ("PerformanceProfile", "CurrentPerformanceProfile") if prop not in props_to_try
-            )
-            last_error = "SteamOS Manager performance profile control unavailable"
-            for interface in interfaces_to_try:
-                for prop in props_to_try:
-                    success, error = self._set_property(interface, prop, "s", profile_id)
-                    if success:
-                        return True, ""
-                    last_error = error
-            return False, last_error
         except Exception as e:
             return False, str(e)
 
-    def _get_charge_limit_property(self) -> tuple[bool, str, str, str, str]:
-        last_error = "SteamOS Manager charge limit API unavailable"
-        for interface in STEAMOS_CHARGE_LIMIT_INTERFACES:
-            for prop in STEAMOS_CHARGE_LIMIT_PROPERTIES:
-                ok, output, error = self._get_property(prop, interface)
-                if ok:
-                    signature = self._busctl_signature(output)
-                    if signature in ("b", "y", "n", "q", "i", "u", "x", "t"):
-                        return True, interface, prop, signature, output
-                elif error:
-                    last_error = error
-        return False, "", "", "", last_error
-
     def get_charge_limit_state(self) -> dict:
-        ok, _interface, _prop, signature, output = self._get_charge_limit_property()
+        if not self._has_property(STEAMOS_CHARGE_LIMIT_INTERFACE, "MaxChargeLevel"):
+            return {
+                "available": False,
+                "enabled": False,
+                "limit": STEAMOS_CHARGE_FULL_PERCENT,
+                "status": "SteamOS Manager charge limit API unavailable on the user bus",
+                "details": "SteamOS Manager BatteryChargeLimit1 interface is unavailable",
+            }
+
+        ok, output, error = self._get_property("MaxChargeLevel", STEAMOS_CHARGE_LIMIT_INTERFACE)
         if not ok:
             return {
                 "available": False,
                 "enabled": False,
                 "limit": STEAMOS_CHARGE_FULL_PERCENT,
-                "status": output,
-                "details": "SteamOS Manager charge limit control unavailable",
+                "status": error,
+                "details": "Failed to read SteamOS Manager battery charge limit",
             }
 
-        if signature == "b":
-            enabled = self._parse_busctl_bool(output)
-            limit = STEAMOS_CHARGE_LIMIT_PERCENT if enabled else STEAMOS_CHARGE_FULL_PERCENT
-        else:
-            limit = self._parse_busctl_int(output)
-            enabled = 0 < limit <= STEAMOS_CHARGE_LIMIT_PERCENT
+        raw_limit = self._parse_busctl_int(output)
+        suggested_minimum = STEAMOS_CHARGE_LIMIT_PERCENT
+        if self._has_property(STEAMOS_CHARGE_LIMIT_INTERFACE, "SuggestedMinimumLimit"):
+            suggested_ok, suggested_output, _ = self._get_property(
+                "SuggestedMinimumLimit",
+                STEAMOS_CHARGE_LIMIT_INTERFACE,
+            )
+            if suggested_ok:
+                suggested_minimum = self._parse_busctl_int(suggested_output)
+        enabled = raw_limit >= 0
+        limit = raw_limit if enabled else STEAMOS_CHARGE_FULL_PERCENT
 
         return {
             "available": True,
             "enabled": enabled,
             "limit": limit or STEAMOS_CHARGE_FULL_PERCENT,
+            "raw_limit": raw_limit,
+            "suggested_minimum": suggested_minimum,
             "status": "available",
-            "details": f"Limits battery charging to {STEAMOS_CHARGE_LIMIT_PERCENT}% through SteamOS Manager",
+            "details": "Controls battery charge limit through SteamOS Manager BatteryChargeLimit1",
         }
 
     def set_charge_limit_enabled(self, enabled: bool) -> tuple[bool, str]:
-        ok, interface, prop, signature, _output = self._get_charge_limit_property()
-        if not ok:
-            return False, "SteamOS Manager charge limit control unavailable"
+        if not self._has_property(STEAMOS_CHARGE_LIMIT_INTERFACE, "MaxChargeLevel"):
+            return False, "SteamOS Manager BatteryChargeLimit1 interface is unavailable on the user bus"
 
-        if signature == "b":
-            return self._set_property(interface, prop, signature, "true" if enabled else "false")
+        value = STEAMOS_CHARGE_LIMIT_PERCENT if enabled else STEAMOS_CHARGE_LIMIT_RESET
+        return self._set_property(STEAMOS_CHARGE_LIMIT_INTERFACE, "MaxChargeLevel", "i", str(value))
 
-        value = STEAMOS_CHARGE_LIMIT_PERCENT if enabled else STEAMOS_CHARGE_FULL_PERCENT
-        return self._set_property(interface, prop, signature, str(value))
+    def get_cpu_boost_state(self) -> dict:
+        if not self._has_property(STEAMOS_CPU_BOOST_INTERFACE, "CpuBoostState"):
+            return {
+                "available": False,
+                "enabled": False,
+                "status": "SteamOS Manager CPU boost API unavailable on the user bus",
+                "details": "SteamOS Manager CpuBoost1 interface is unavailable",
+            }
 
-    def _get_smt_property(self) -> tuple[bool, str, str, str, str]:
-        last_error = "SteamOS Manager SMT control unavailable"
-        for interface in STEAMOS_SMT_INTERFACES:
-            for prop in STEAMOS_SMT_PROPERTIES:
-                ok, output, error = self._get_property(prop, interface)
-                if ok:
-                    signature = self._busctl_signature(output)
-                    if signature in ("b", "y", "n", "q", "i", "u", "x", "t"):
-                        return True, interface, prop, signature, output
-                elif error:
-                    last_error = error
-        return False, "", "", "", last_error
-
-    def get_smt_state(self) -> dict:
-        ok, _interface, _prop, signature, output = self._get_smt_property()
+        ok, output, error = self._get_property("CpuBoostState", STEAMOS_CPU_BOOST_INTERFACE)
         if not ok:
             return {
                 "available": False,
                 "enabled": False,
-                "status": output,
-                "details": "SteamOS Manager SMT control unavailable",
+                "status": error,
+                "details": "Failed to read SteamOS Manager CPU boost state",
             }
 
-        enabled = (
-            self._parse_busctl_bool(output)
-            if signature == "b"
-            else self._parse_busctl_int(output) > 0
-        )
+        enabled = self._parse_busctl_int(output) > 0
         return {
             "available": True,
             "enabled": enabled,
             "status": "available",
-            "details": "Controls SMT through SteamOS Manager",
+            "details": "Controls CPU boost through SteamOS Manager CpuBoost1",
+        }
+
+    def set_cpu_boost_enabled(self, enabled: bool) -> tuple[bool, str]:
+        if not self._has_property(STEAMOS_CPU_BOOST_INTERFACE, "CpuBoostState"):
+            return False, "SteamOS Manager CpuBoost1 interface is unavailable on the user bus"
+        return self._set_property(
+            STEAMOS_CPU_BOOST_INTERFACE,
+            "CpuBoostState",
+            "u",
+            "1" if enabled else "0",
+        )
+
+    def get_smt_state(self) -> dict:
+        return {
+            "available": False,
+            "enabled": False,
+            "status": "SteamOS Manager SMT control unavailable",
+            "details": "SteamOS 3.8 SteamOS Manager does not expose an SMT interface",
         }
 
     def set_smt_enabled(self, enabled: bool) -> tuple[bool, str]:
-        ok, interface, prop, signature, _output = self._get_smt_property()
-        if not ok:
-            return False, "SteamOS Manager SMT control unavailable"
-
-        if signature == "b":
-            return self._set_property(interface, prop, signature, "true" if enabled else "false")
-
-        return self._set_property(interface, prop, signature, "1" if enabled else "0")
+        return False, "SteamOS 3.8 SteamOS Manager does not expose SMT control"
 
 
 class GamescopeSettingsClient:
@@ -3480,17 +3417,27 @@ class Plugin:
             "smt_status": smt.get("status", ""),
             "smt_details": smt.get("details", ""),
             "boost_enabled": False,
-            "boost_available": os.path.exists(CPU_BOOST_PATH)
+            "boost_available": False,
         }
-        
+
         try:
-            if os.path.exists(CPU_BOOST_PATH):
+            if self.steamos_manager is None:
+                self.steamos_manager = SteamOsManagerClient(decky.logger)
+
+            boost_state = self.steamos_manager.get_cpu_boost_state()
+            if boost_state.get("available", False):
+                result["boost_available"] = True
+                result["boost_enabled"] = boost_state.get("enabled", False)
+                result["boost_status"] = boost_state.get("status", "")
+                result["boost_details"] = boost_state.get("details", "")
+            elif os.path.exists(CPU_BOOST_PATH):
+                result["boost_available"] = True
                 with open(CPU_BOOST_PATH, 'r') as f:
-                    boost_state = f.read().strip()
-                result["boost_enabled"] = boost_state == "1"
+                    boost_value = f.read().strip()
+                result["boost_enabled"] = boost_value == "1"
         except Exception as e:
             decky.logger.error(f"Failed to read CPU settings: {e}")
-        
+
         return result
 
     async def set_cpu_boost_enabled(self, enabled: bool) -> bool:
@@ -3501,16 +3448,26 @@ class Plugin:
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
                 return False
 
-            if not os.path.exists(CPU_BOOST_PATH):
-                decky.logger.warning("CPU boost control not available")
-                return False
-            
-            value = "1" if enabled else "0"
-            success, error = self._write_file(CPU_BOOST_PATH, value, use_sudo=True)
-            if not success:
-                decky.logger.warning(f"Failed to set CPU boost: {error}")
-                return False
-            
+            if self.steamos_manager is None:
+                self.steamos_manager = SteamOsManagerClient(decky.logger)
+
+            native_state = self.steamos_manager.get_cpu_boost_state()
+            if native_state.get("available", False):
+                success, error = self.steamos_manager.set_cpu_boost_enabled(enabled)
+                if not success:
+                    decky.logger.warning(f"Failed to set SteamOS CPU boost: {error}")
+                    return False
+            else:
+                if not os.path.exists(CPU_BOOST_PATH):
+                    decky.logger.warning("CPU boost control not available")
+                    return False
+
+                value = "1" if enabled else "0"
+                success, error = self._write_file(CPU_BOOST_PATH, value, use_sudo=True)
+                if not success:
+                    decky.logger.warning(f"Failed to set CPU boost: {error}")
+                    return False
+
             decky.logger.info(f"CPU boost {'enabled' if enabled else 'disabled'}")
             return True
             
