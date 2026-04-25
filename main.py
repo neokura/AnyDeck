@@ -1583,10 +1583,16 @@ class Plugin:
             return {
                 "available": False,
                 "enabled": False,
+                "mode": "solid",
                 "color": RGB_COLOR_PRESETS[0],
                 "brightness": RGB_DEFAULT_BRIGHTNESS,
                 "brightness_available": False,
                 "supports_free_color": False,
+                "capabilities": {
+                    "toggle": False,
+                    "color": False,
+                    "brightness": False,
+                },
                 "presets": RGB_COLOR_PRESETS,
                 "details": support.get("reason", "Platform is not supported"),
             }
@@ -1606,10 +1612,16 @@ class Plugin:
         return {
             "available": backend["type"] != "none",
             "enabled": enabled,
+            "mode": "solid",
             "color": color,
             "brightness": brightness,
             "brightness_available": backend["type"] != "none",
             "supports_free_color": backend["type"] != "none",
+            "capabilities": {
+                "toggle": backend["type"] != "none",
+                "color": backend["type"] != "none",
+                "brightness": backend["type"] != "none",
+            },
             "presets": RGB_COLOR_PRESETS,
             "details": backend["details"],
         }

@@ -806,6 +806,10 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertTrue(success)
         self.assertEqual(values, "0 255 0")
         self.assertEqual(state["brightness"], 100)
+        self.assertEqual(state["mode"], "solid")
+        self.assertTrue(state["capabilities"]["toggle"])
+        self.assertTrue(state["capabilities"]["color"])
+        self.assertTrue(state["capabilities"]["brightness"])
 
     def test_rgb_accepts_freeform_hex_color_on_sysfs_backend(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -994,10 +998,16 @@ eDP-1 connected primary 1920x1080+0+0
             return_value={
                 "available": True,
                 "enabled": True,
+                "mode": "solid",
                 "color": "#00FFFF",
                 "brightness": 75,
                 "brightness_available": True,
                 "supports_free_color": True,
+                "capabilities": {
+                    "toggle": True,
+                    "color": True,
+                    "brightness": True,
+                },
                 "presets": main.RGB_COLOR_PRESETS,
                 "details": "rgb",
             },

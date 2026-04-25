@@ -150,10 +150,16 @@ interface AvailabilityToggle {
 interface RgbState {
   available: boolean;
   enabled: boolean;
+  mode: string;
   color: string;
   brightness: number;
   brightness_available: boolean;
   supports_free_color: boolean;
+  capabilities: {
+    toggle: boolean;
+    color: boolean;
+    brightness: boolean;
+  };
   presets: string[];
   details: string;
 }
@@ -1049,6 +1055,15 @@ const RGBView: VFC<{
     clamp(rgb?.brightness ?? 100, 0, 100)
   );
   const activeColor = selectedColor;
+  const canToggleRgb = Boolean(rgb?.capabilities?.toggle ?? rgb?.available);
+  const canAdjustColor = Boolean(rgb?.capabilities?.color ?? rgb?.supports_free_color);
+  const canAdjustBrightness = Boolean(
+    rgb?.capabilities?.brightness ?? rgb?.brightness_available
+  );
+  const controlScopeLabel = rgb?.enabled ? "Live output" : "Next output on enable";
+  const controlScopeDescription = rgb?.enabled
+    ? "Changes apply immediately."
+    : "HueSync-style staging: these values are saved now and applied when RGB is turned back on.";
 
   useEffect(() => {
     setSelectedColor(normalizedColor);
@@ -1151,6 +1166,16 @@ const RGBView: VFC<{
 
           <PanelSection title="RGB">
             <PanelSectionRow>
+              <ToggleField
+                label={`RGB: ${rgb.enabled ? "enabled" : "disabled"}`}
+                description={rgb.enabled ? rgb.details : `${rgb.details}. ${controlScopeDescription}`}
+                checked={rgb.enabled}
+                disabled={!canToggleRgb || controlsDisabled}
+                onChange={handleRgbToggle}
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
               <div style={cardStyle}>
                 <div style={rgbHeroStyle(rgb.enabled, activeColor)}>
                   <div style={{ display: "flex", justifyContent: "space-between", gap: "12px" }}>
@@ -1159,7 +1184,10 @@ const RGBView: VFC<{
                         {rgb.enabled ? "Lighting Enabled" : "Lighting Disabled"}
                       </div>
                       <div style={{ ...subtextStyle, color: "rgba(255,255,255,0.8)" }}>
-                        {rgb.details}
+                        {controlScopeLabel}
+                      </div>
+                      <div style={{ ...subtextStyle, color: "rgba(255,255,255,0.8)" }}>
+                        {rgb.mode === "solid" ? "Solid color profile" : rgb.mode}
                       </div>
                     </div>
                     <div
@@ -1202,20 +1230,17 @@ const RGBView: VFC<{
             </PanelSectionRow>
 
             <PanelSectionRow>
-              <ToggleField
-                label={`RGB: ${rgb.enabled ? "enabled" : "disabled"}`}
-                description={rgb.details}
-                checked={rgb.enabled}
-                disabled={!rgb.available || controlsDisabled}
-                onChange={handleRgbToggle}
-              />
+              <div style={cardStyle}>
+                <div style={viewTitleStyle}>Fine Control</div>
+                <div style={subtextStyle}>{controlScopeDescription}</div>
+              </div>
             </PanelSectionRow>
 
             <PanelSectionRow>
               <SliderField
                 label={`Hue: ${RGB_PRESET_LABELS[activeColor] || activeColor}`}
                 description={
-                  rgb.supports_free_color
+                  canAdjustColor
                     ? rgb.enabled
                       ? "Free color selection across the full spectrum"
                       : "Choose the next color before enabling RGB"
@@ -1225,7 +1250,7 @@ const RGBView: VFC<{
                 min={0}
                 max={360}
                 step={5}
-                disabled={!rgb.supports_free_color || controlsDisabled}
+                disabled={!canAdjustColor || controlsDisabled}
                 showValue={false}
                 notchCount={7}
                 notchTicksVisible
@@ -1263,7 +1288,7 @@ const RGBView: VFC<{
               <SliderField
                 label={`Brightness: ${brightnessValue}%`}
                 description={
-                  rgb.brightness_available
+                  canAdjustBrightness
                     ? "Shared intensity model normalized to 0-100 across supported devices"
                     : rgb.details
                 }
@@ -1271,7 +1296,7 @@ const RGBView: VFC<{
                 min={0}
                 max={100}
                 step={5}
-                disabled={!rgb.brightness_available || controlsDisabled}
+                disabled={!canAdjustBrightness || controlsDisabled}
                 showValue={false}
                 notchCount={6}
                 notchTicksVisible
@@ -1307,10 +1332,10 @@ const RGBView: VFC<{
                       <button
                         key={color}
                         type="button"
-                        disabled={!rgb.available || controlsDisabled}
+                        disabled={!canAdjustColor || controlsDisabled}
                         style={{
                           ...rgbQuickSwatchButtonStyle(active, color),
-                          opacity: !rgb.available || controlsDisabled ? 0.45 : 1,
+                          opacity: !canAdjustColor || controlsDisabled ? 0.45 : 1,
                         }}
                         onClick={() => {
                           setSelectedColor(color);
