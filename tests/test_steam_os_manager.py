@@ -118,6 +118,43 @@ class SteamOsManagerClientTest(unittest.TestCase):
         self.assertEqual(state["available_native"], [])
         self.assertIn("SteamOS native profiles unavailable", state["status"])
 
+    def test_discovers_performance_interface_via_introspection(self):
+        def fake_run(cmd, **_kwargs):
+            if "introspect" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "\n".join(
+                        [
+                            "com.steampowered.SteamOSManager1 interface - -",
+                            "AvailablePerformanceProfiles property as 3 emits-change",
+                            "PerformanceProfile property s - emits-change",
+                            "SuggestedDefaultPerformanceProfile property s - emits-change",
+                        ]
+                    ),
+                    "",
+                )
+            prop = cmd[-1]
+            if prop == "AvailablePerformanceProfiles":
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    'as 3 "low-power" "balanced" "performance"\n',
+                    "",
+                )
+            if prop == "PerformanceProfile":
+                return subprocess.CompletedProcess(cmd, 0, 's "balanced"\n', "")
+            if prop == "SuggestedDefaultPerformanceProfile":
+                return subprocess.CompletedProcess(cmd, 0, 's "performance"\n', "")
+            return subprocess.CompletedProcess(cmd, 1, "", "unknown interface")
+
+        with patch("main.subprocess.run", side_effect=fake_run):
+            client = main.SteamOsManagerClient(FakeLogger())
+            state = client.get_performance_state()
+
+        self.assertTrue(state["available"])
+        self.assertEqual(state["current"], "balanced")
+
     def test_sets_native_performance_profile(self):
         calls = []
 
@@ -131,8 +168,9 @@ class SteamOsManagerClientTest(unittest.TestCase):
 
         self.assertTrue(success)
         self.assertEqual(error, "")
-        self.assertIn("set-property", calls[0])
-        self.assertEqual(calls[0][-1], "low-power")
+        set_calls = [call for call in calls if "set-property" in call]
+        self.assertTrue(set_calls)
+        self.assertEqual(set_calls[0][-1], "low-power")
 
     def test_reads_steamos_charge_limit_state(self):
         def fake_run(cmd, **_kwargs):
@@ -290,6 +328,27 @@ class GamescopeSettingsClientTest(unittest.TestCase):
 
         self.assertEqual(state["display"], ":1")
         self.assertTrue(state["vrr"]["available"])
+
+    def test_vrr_stays_available_when_capable_atom_is_missing_but_enabled_atom_exists(self):
+        outputs = {
+            main.GAMESCOPE_VRR_ENABLED_ATOM: "GAMESCOPE_VRR_ENABLED(CARDINAL) = 1\n",
+            main.GAMESCOPE_VRR_FEEDBACK_ATOM: "GAMESCOPE_VRR_FEEDBACK(CARDINAL) = 1\n",
+            main.GAMESCOPE_ALLOW_TEARING_ATOM: "GAMESCOPE_ALLOW_TEARING(CARDINAL) = 0\n",
+        }
+
+        def fake_run(cmd, **_kwargs):
+            atom = cmd[-1]
+            if atom == main.GAMESCOPE_VRR_CAPABLE_ATOM:
+                return subprocess.CompletedProcess(cmd, 1, "", "no such atom")
+            return subprocess.CompletedProcess(cmd, 0, outputs[atom], "")
+
+        with patch("main.subprocess.run", side_effect=fake_run):
+            client = main.GamescopeSettingsClient(FakeLogger(), display=":0")
+            state = client.get_display_sync_state()
+
+        self.assertTrue(state["vrr"]["available"])
+        self.assertTrue(state["vrr"]["enabled"])
+        self.assertTrue(state["vrr"]["active"])
 
 
 class PluginPerformanceProfileTest(unittest.TestCase):
@@ -634,6 +693,49 @@ eDP-1 connected primary 1920x1080+0+0
             result = asyncio.run(plugin.set_fps_limit(45))
 
         self.assertFalse(result)
+
+    def test_fps_limit_state_reads_alternate_gamescopectl_output(self):
+        plugin = main.Plugin()
+
+        def fake_run_command_output(command):
+            if command[1] == "debug_get_fps_limit":
+                return False, "unknown command"
+            if command[1] == "get_fps_limit":
+                return True, "current_fps_limit 40"
+            return False, ""
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin,
+            "_command_exists",
+            return_value=True,
+        ), patch.object(
+            plugin,
+            "_run_command_output",
+            side_effect=fake_run_command_output,
+        ):
+            state = asyncio.run(plugin.get_fps_limit_state())
+
+        self.assertTrue(state["available"])
+        self.assertTrue(state["is_live"])
+        self.assertEqual(state["current"], 40)
+
+    def test_fps_limit_state_falls_back_to_gamescope_atom(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin,
+            "_command_exists",
+            return_value=False,
+        ), patch.object(
+            main.GamescopeSettingsClient,
+            "get_fps_limit_state",
+            return_value=(True, 60, "", "GAMESCOPE_FPS_LIMIT"),
+        ):
+            state = asyncio.run(plugin.get_fps_limit_state())
+
+        self.assertTrue(state["available"])
+        self.assertEqual(state["current"], 60)
+        self.assertTrue(state["is_live"])
 
     def test_charge_limit_returns_false_when_control_is_unavailable(self):
         plugin = main.Plugin()

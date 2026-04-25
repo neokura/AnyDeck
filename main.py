@@ -46,6 +46,11 @@ PLUGIN_NAME = "Xbox Companion"
 STEAMOS_MANAGER_SERVICE = "com.steampowered.SteamOSManager1"
 STEAMOS_MANAGER_OBJECT = "/com/steampowered/SteamOSManager1"
 STEAMOS_PERFORMANCE_INTERFACE = "com.steampowered.SteamOSManager1.PerformanceProfile1"
+STEAMOS_PERFORMANCE_INTERFACES = [
+    "com.steampowered.SteamOSManager1.PerformanceProfile1",
+    "com.steampowered.SteamOSManager1",
+    "com.steampowered.SteamOSManager1.PowerManagement1",
+]
 STEAMOS_CHARGE_LIMIT_PERCENT = 80
 STEAMOS_CHARGE_FULL_PERCENT = 100
 STEAMOS_CHARGE_LIMIT_INTERFACES = [
@@ -81,6 +86,10 @@ GAMESCOPE_VRR_CAPABLE_ATOM = "GAMESCOPE_VRR_CAPABLE"
 GAMESCOPE_VRR_ENABLED_ATOM = "GAMESCOPE_VRR_ENABLED"
 GAMESCOPE_VRR_FEEDBACK_ATOM = "GAMESCOPE_VRR_FEEDBACK"
 GAMESCOPE_ALLOW_TEARING_ATOM = "GAMESCOPE_ALLOW_TEARING"
+GAMESCOPE_FPS_LIMIT_ATOMS = [
+    "GAMESCOPE_FPS_LIMIT",
+    "GAMESCOPE_FRAMERATE_LIMIT",
+]
 
 NATIVE_PERFORMANCE_PROFILES = {
     "low-power": {
@@ -271,6 +280,55 @@ class SteamOsManagerClient:
             env=sanitized_system_env(),
         )
 
+    def _introspect_interfaces(self) -> dict[str, set[str]]:
+        try:
+            result = self._run_busctl([
+                "introspect",
+                STEAMOS_MANAGER_SERVICE,
+                STEAMOS_MANAGER_OBJECT,
+            ])
+        except Exception:
+            return {}
+
+        if result.returncode != 0:
+            return {}
+
+        interfaces: dict[str, set[str]] = {}
+        current_interface = ""
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            if parts[1] == "interface":
+                current_interface = parts[0]
+                interfaces.setdefault(current_interface, set())
+                continue
+            if parts[1] == "property" and current_interface:
+                interfaces.setdefault(current_interface, set()).add(parts[0])
+        return interfaces
+
+    def _discover_property_interface(
+        self,
+        candidate_interfaces: list[str],
+        candidate_properties: list[str],
+    ) -> tuple[str, str]:
+        interfaces = self._introspect_interfaces()
+        for interface in candidate_interfaces:
+            properties = interfaces.get(interface, set())
+            for prop in candidate_properties:
+                if prop in properties:
+                    return interface, prop
+
+        for interface, properties in interfaces.items():
+            for prop in candidate_properties:
+                if prop in properties:
+                    return interface, prop
+
+        return "", ""
+
     def _get_property(
         self,
         prop: str,
@@ -354,9 +412,29 @@ class SteamOsManagerClient:
         return tokens[1:]
 
     def get_performance_state(self) -> dict:
-        available_ok, available_output, available_error = self._get_property(
-            "AvailablePerformanceProfiles"
+        performance_interface, available_prop = self._discover_property_interface(
+            STEAMOS_PERFORMANCE_INTERFACES,
+            [
+                "AvailablePerformanceProfiles",
+                "AvailableProfiles",
+            ],
         )
+        if not performance_interface:
+            performance_interface = STEAMOS_PERFORMANCE_INTERFACE
+        available_ok, available_output, available_error = self._get_property(
+            available_prop or "AvailablePerformanceProfiles",
+            performance_interface,
+        )
+        if not available_ok:
+            for interface in STEAMOS_PERFORMANCE_INTERFACES:
+                for prop in ("AvailablePerformanceProfiles", "AvailableProfiles"):
+                    available_ok, available_output, available_error = self._get_property(prop, interface)
+                    if available_ok:
+                        performance_interface = interface
+                        available_prop = prop
+                        break
+                if available_ok:
+                    break
         if not available_ok:
             return {
                 "available": False,
@@ -368,11 +446,31 @@ class SteamOsManagerClient:
 
         available_native = self._parse_busctl_string_array(available_output)
 
-        current_ok, current_output, current_error = self._get_property("PerformanceProfile")
+        current_prop = "PerformanceProfile"
+        if performance_interface:
+            current_interface, discovered_current = self._discover_property_interface(
+                [performance_interface],
+                ["PerformanceProfile", "CurrentPerformanceProfile"],
+            )
+            if current_interface:
+                performance_interface = current_interface
+            if discovered_current:
+                current_prop = discovered_current
+
+        current_ok, current_output, current_error = self._get_property(
+            current_prop,
+            performance_interface,
+        )
         current = self._parse_busctl_string(current_output) if current_ok else ""
 
+        suggested_prop = "SuggestedDefaultPerformanceProfile"
+        suggested_interface, discovered_suggested = self._discover_property_interface(
+            [performance_interface],
+            ["SuggestedDefaultPerformanceProfile", "DefaultPerformanceProfile"],
+        )
         suggested_ok, suggested_output, _ = self._get_property(
-            "SuggestedDefaultPerformanceProfile"
+            discovered_suggested or suggested_prop,
+            suggested_interface or performance_interface,
         )
         suggested_default = (
             self._parse_busctl_string(suggested_output)
@@ -393,12 +491,26 @@ class SteamOsManagerClient:
 
     def set_performance_profile(self, profile_id: str) -> tuple[bool, str]:
         try:
-            return self._set_property(
-                STEAMOS_PERFORMANCE_INTERFACE,
-                "PerformanceProfile",
-                "s",
-                profile_id,
+            performance_interface, current_prop = self._discover_property_interface(
+                STEAMOS_PERFORMANCE_INTERFACES,
+                ["PerformanceProfile", "CurrentPerformanceProfile"],
             )
+            interfaces_to_try = [performance_interface] if performance_interface else []
+            interfaces_to_try.extend(
+                interface for interface in STEAMOS_PERFORMANCE_INTERFACES if interface not in interfaces_to_try
+            )
+            props_to_try = [current_prop] if current_prop else []
+            props_to_try.extend(
+                prop for prop in ("PerformanceProfile", "CurrentPerformanceProfile") if prop not in props_to_try
+            )
+            last_error = "SteamOS Manager performance profile control unavailable"
+            for interface in interfaces_to_try:
+                for prop in props_to_try:
+                    success, error = self._set_property(interface, prop, "s", profile_id)
+                    if success:
+                        return True, ""
+                    last_error = error
+            return False, last_error
         except Exception as e:
             return False, str(e)
 
@@ -573,6 +685,16 @@ class GamescopeSettingsClient:
 
         return False, 0, last_error or f"{atom} is not available"
 
+    def _read_first_available_cardinal(self, atoms: list[str]) -> tuple[bool, int, str, str]:
+        last_error = ""
+        for atom in atoms:
+            ok, value, error = self._read_cardinal(atom)
+            if ok:
+                return True, value, "", atom
+            if error:
+                last_error = error
+        return False, 0, last_error or "gamescope property is not available", ""
+
     def _set_cardinal(self, atom: str, enabled: bool) -> tuple[bool, str]:
         last_error = ""
 
@@ -605,6 +727,12 @@ class GamescopeSettingsClient:
 
         return False, last_error or "xprop write failed"
 
+    def _read_integer_atom(self, atoms: list[str]) -> tuple[bool, int, str, str]:
+        return self._read_first_available_cardinal(atoms)
+
+    def get_fps_limit_state(self) -> tuple[bool, int, str, str]:
+        return self._read_integer_atom(GAMESCOPE_FPS_LIMIT_ATOMS)
+
     def get_display_sync_state(self) -> dict:
         vrr_capable_ok, vrr_capable_value, vrr_capable_error = self._read_cardinal(
             GAMESCOPE_VRR_CAPABLE_ATOM
@@ -619,13 +747,17 @@ class GamescopeSettingsClient:
             GAMESCOPE_ALLOW_TEARING_ATOM
         )
 
-        vrr_capable = vrr_capable_ok and bool(vrr_capable_value)
+        vrr_capable = (
+            (vrr_capable_ok and bool(vrr_capable_value))
+            or vrr_enabled_ok
+            or vrr_feedback_ok
+        )
         vrr_enabled = vrr_enabled_ok and bool(vrr_enabled_value)
         vrr_active = vrr_feedback_ok and bool(vrr_feedback_value)
 
-        if not vrr_capable_ok:
+        if not vrr_capable_ok and not (vrr_enabled_ok or vrr_feedback_ok):
             vrr_status = f"VRR state unavailable: {vrr_capable_error}"
-        elif not vrr_capable:
+        elif vrr_capable_ok and not bool(vrr_capable_value):
             vrr_status = "Display is not VRR capable"
         else:
             vrr_status = "available"
@@ -639,7 +771,7 @@ class GamescopeSettingsClient:
             "backend": "gamescope-xprop",
             "display": self.display,
             "vrr": {
-                "available": vrr_capable_ok and vrr_capable,
+                "available": vrr_capable,
                 "capable": vrr_capable,
                 "enabled": vrr_enabled,
                 "active": vrr_active,
@@ -2993,18 +3125,40 @@ class Plugin:
                 "details": support.get("reason", "Platform is not supported"),
             }
 
+        if self.gamescope_settings is None:
+            self.gamescope_settings = GamescopeSettingsClient(decky.logger)
+
         available = self._command_exists("gamescopectl")
         live_value = None
 
         if available:
-            success, output = self._run_command_output(["gamescopectl", "debug_get_fps_limit"])
-            if success:
-                try:
-                    live_value = int((output or "0").splitlines()[-1])
-                except Exception as exc:
-                    decky.logger.warning(f"Could not parse live gamescope fps limit: {exc}")
-            elif output:
-                decky.logger.warning(f"Could not read live gamescope fps limit: {output}")
+            for command in (
+                ["gamescopectl", "debug_get_fps_limit"],
+                ["gamescopectl", "get_fps_limit"],
+            ):
+                success, output = self._run_command_output(command)
+                if not success:
+                    continue
+                tokens = [token for token in shlex.split(output) if token.strip()]
+                integers = []
+                for token in tokens:
+                    try:
+                        integers.append(int(token, 0))
+                    except ValueError:
+                        continue
+                if integers:
+                    live_value = integers[-1]
+                    break
+            if live_value is None:
+                ok, atom_value, _error, _atom = self.gamescope_settings.get_fps_limit_state()
+                if ok:
+                    live_value = atom_value
+
+        if live_value is None:
+            ok, atom_value, _error, _atom = self.gamescope_settings.get_fps_limit_state()
+            if ok:
+                live_value = atom_value
+                available = True
 
         current = 0 if live_value is None else live_value
         return {
@@ -3013,7 +3167,7 @@ class Plugin:
             "requested": current,
             "is_live": live_value is not None,
             "presets": self._get_fps_presets(),
-            "status": "available" if available else "gamescopectl is not installed",
+            "status": "available" if available else "gamescopectl or gamescope fps properties are unavailable",
             "details": (
                 "Uses live gamescope framerate control"
                 if live_value is not None
@@ -3038,11 +3192,15 @@ class Plugin:
             decky.logger.warning(f"Unsupported framerate preset: {value}")
             return False
 
-        success, error = self._run_command([
-            "gamescopectl",
-            "debug_set_fps_limit",
-            str(value),
-        ])
+        success = False
+        error = "Failed to set framerate limit"
+        for command in (
+            ["gamescopectl", "debug_set_fps_limit", str(value)],
+            ["gamescopectl", "set_fps_limit", str(value)],
+        ):
+            success, error = self._run_command(command)
+            if success:
+                break
         if not success:
             decky.logger.error(f"Failed to set framerate limit: {error}")
             return False

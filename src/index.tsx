@@ -330,6 +330,10 @@ const cardStyle: React.CSSProperties = {
   borderRadius: "8px",
   padding: "14px",
   marginBottom: "12px",
+  width: "100%",
+  boxSizing: "border-box",
+  minWidth: 0,
+  overflow: "hidden",
 };
 
 const statusRowStyle: React.CSSProperties = {
@@ -370,12 +374,11 @@ const optionGridStyle: React.CSSProperties = {
   width: "100%",
 };
 
-const fpsSliderMetaStyle: React.CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  alignItems: "center",
-  gap: "12px",
-  marginTop: "4px",
+const performanceModeGridStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+  gap: "8px",
+  width: "100%",
 };
 
 const rgbHeroStyle = (enabled: boolean, color: string): React.CSSProperties => ({
@@ -449,10 +452,11 @@ const rgbModeButtonStyle = (active: boolean): React.CSSProperties => ({
     : "1px solid rgba(100, 116, 139, 0.35)",
 });
 
-const modeButtonStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
+const compactModeButtonStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
   width: "100%",
+  minWidth: 0,
   borderRadius: "12px",
-  padding: "9px 10px",
+  padding: "10px 8px",
   background: active
     ? "linear-gradient(180deg, #60a5fa, #3b82f6)"
     : "linear-gradient(180deg, rgba(51,65,85,0.9), rgba(30,41,59,0.9))",
@@ -460,6 +464,7 @@ const modeButtonStyle = (active: boolean, disabled: boolean): React.CSSPropertie
     ? "1px solid rgba(191, 219, 254, 0.9)"
     : "1px solid rgba(100, 116, 139, 0.35)",
   opacity: disabled ? 0.45 : 1,
+  overflow: "hidden",
 });
 
 const statusColor = (status: string): string => {
@@ -490,6 +495,49 @@ const formatToggleLabel = (
 
 const formatFpsLabel = (value: number): string =>
   value === 0 ? "Unlimited" : `${value} FPS`;
+
+const formatFpsReadout = (state: FpsLimitState): string => {
+  if (!state.available) {
+    return state.status;
+  }
+  if (state.is_live) {
+    return `Current limit: ${formatFpsLabel(state.current)}`;
+  }
+  return state.details;
+};
+
+const PerformanceModeGlyph: VFC<{ modeId: string; active: boolean }> = ({
+  modeId,
+  active,
+}) => {
+  const stroke = active ? "#0f172a" : "#e2e8f0";
+  const fill = "none";
+
+  if (modeId === "low-power") {
+    return (
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <rect x="6" y="8" width="10" height="8" rx="2" stroke={stroke} strokeWidth="1.8" fill={fill} />
+        <path d="M17 10.5H18.5V13.5H17" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
+        <path d="M8.5 12H10.4" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
+      </svg>
+    );
+  }
+
+  if (modeId === "balanced") {
+    return (
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path d="M12 5L18 8.5V15.5L12 19L6 15.5V8.5L12 5Z" stroke={stroke} strokeWidth="1.8" fill={fill} />
+        <path d="M9 12H15" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+      <path d="M13 3L6 13H11L10 21L18 10H13L13 3Z" stroke={stroke} strokeWidth="1.8" fill={fill} strokeLinejoin="round" />
+    </svg>
+  );
+};
 
 const hardwareControlLabels: Record<string, string> = {
   performance_profiles: "SteamOS profiles",
@@ -755,57 +803,55 @@ const DashboardView: VFC<{
         </PanelSectionRow>
       )}
 
-      {data.performance_modes.map((mode) => (
-        <PanelSectionRow key={mode.id}>
-          <ButtonItem
-            layout="below"
-            onClick={() => handlePerformanceProfile(mode.native_id, mode.label)}
-            disabled={!mode.available || controlsDisabled}
-          >
-            <div style={modeButtonStyle(mode.active, !mode.available || controlsDisabled)}>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  gap: "12px",
-                }}
-              >
+      <PanelSectionRow>
+        <div style={performanceModeGridStyle}>
+          {data.performance_modes.map((mode) => (
+            <ButtonItem
+              key={mode.id}
+              layout="below"
+              onClick={() => handlePerformanceProfile(mode.native_id, mode.label)}
+              disabled={!mode.available || controlsDisabled}
+            >
+              <div style={compactModeButtonStyle(mode.active, !mode.available || controlsDisabled)}>
                 <div
                   style={{
-                    color: mode.active ? "#0f172a" : "#ffffff",
-                    fontWeight: 800,
-                    fontSize: "13px",
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: "6px",
+                    textAlign: "center",
+                    minWidth: 0,
                   }}
                 >
-                  {mode.label}
-                </div>
-                {mode.active && (
+                  <PerformanceModeGlyph modeId={mode.id} active={mode.active} />
                   <div
                     style={{
-                      color: "#0f172a",
+                      color: mode.active ? "#0f172a" : "#ffffff",
+                      fontWeight: 800,
                       fontSize: "11px",
-                      fontWeight: 700,
+                      lineHeight: 1.2,
+                      overflowWrap: "anywhere",
                     }}
                   >
-                    Active
+                    {mode.label}
                   </div>
-                )}
+                  <div
+                    style={{
+                      color: mode.active ? "rgba(15,23,42,0.82)" : "#94a3b8",
+                      fontSize: "10px",
+                      fontWeight: 700,
+                      lineHeight: 1.2,
+                    }}
+                  >
+                    {mode.active ? "Active" : mode.available ? "Ready" : "Unavailable"}
+                  </div>
+                </div>
               </div>
-              <div
-                style={{
-                  color: mode.active ? "rgba(15,23,42,0.85)" : "#cbd5e1",
-                  fontSize: "11px",
-                  marginTop: "4px",
-                  lineHeight: 1.35,
-                }}
-              >
-                {mode.available ? mode.description : "Mode unavailable on this system"}
-              </div>
-            </div>
-          </ButtonItem>
-        </PanelSectionRow>
-      ))}
+            </ButtonItem>
+          ))}
+        </div>
+      </PanelSectionRow>
 
       <PanelSectionRow>
         <ToggleField
@@ -870,23 +916,9 @@ const DashboardView: VFC<{
       </PanelSectionRow>
 
       <PanelSectionRow>
-        <div style={cardStyle}>
-          <div style={viewTitleStyle}>Max Framerate</div>
-          <div style={subtextStyle}>{data.fps_limit.details}</div>
-          <div style={fpsSliderMetaStyle}>
-            <div style={{ ...subtextStyle, color: "#cbd5e1" }}>
-              {data.fps_limit.is_live ? "Live gamescope value" : "Preset selection"}
-            </div>
-            <div style={{ color: "#ffffff", fontSize: "12px", fontWeight: 700 }}>
-              {formatFpsLabel(fpsPresetValue)}
-            </div>
-          </div>
-        </div>
-      </PanelSectionRow>
-      <PanelSectionRow>
         <SliderField
           label={`Max Framerate: ${formatFpsLabel(fpsPresetValue)}`}
-          description={data.fps_limit.available ? "Horizontal preset selector" : data.fps_limit.status}
+          description={formatFpsReadout(data.fps_limit)}
           value={fpsPresetIndex}
           min={0}
           max={Math.max(0, fpsPresets.length - 1)}
