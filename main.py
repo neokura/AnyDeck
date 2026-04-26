@@ -14,6 +14,14 @@ import shlex
 import glob
 import shutil
 import importlib
+import sys
+
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+# Decky loads `main.py` via importlib, which does not guarantee sibling modules
+# are importable unless we add the plugin directory explicitly.
+for import_path in (PLUGIN_DIR, os.path.join(PLUGIN_DIR, "dist")):
+    if import_path not in sys.path:
+        sys.path.insert(0, import_path)
 
 import decky
 from state_aggregator import StateAggregator
@@ -33,7 +41,6 @@ from rgb_support import (
     RGB_DEFAULT_MODE,
     RGB_DEFAULT_SPEED,
     RGB_SPEED_OPTIONS,
-    asus_hid_rgb_commands,
     clamp_int,
     get_rgb_mode_capabilities,
     get_rgb_supported_modes,
@@ -105,6 +112,9 @@ BATTERY_PATH_GLOBS = [
 ]
 DMI_PATH = "/sys/class/dmi/id"
 ALLY_LED_PATH = "/sys/class/leds/ally:rgb:joystick_rings"
+ASUS_WMI_PATH = "/sys/devices/platform/asus-nb-wmi"
+ASUS_CHARGE_LIMIT_PATH = f"{ASUS_WMI_PATH}/charge_control_end_threshold"
+ASUS_MCU_POWERSAVE_PATH = f"{ASUS_WMI_PATH}/mcu_powersave"
 SMT_CONTROL_PATH = "/sys/devices/system/cpu/smt/control"
 
 RGB_LED_PATH_GLOBS = [
@@ -193,15 +203,6 @@ LEGION_GO_TABLET_HID = {
     "usage": 0x0001,
     "interface": None,
     "protocol": "legion_go_tablet",
-}
-ASUS_ALLY_HID = {
-    "name": "ASUS Handheld HID RGB",
-    "vid": 0x0B05,
-    "pids": [],
-    "usage_page": 0xFF31,
-    "usage": 0x0080,
-    "interface": None,
-    "protocol": "asus_ally",
 }
 
 ATOMIC_UPDATE_DIR = "/etc/atomic-update.conf.d"
@@ -450,7 +451,7 @@ class HostRuntime:
 
         return {"available": False, "path": host_path, "via_host": False}
 
-    def _prepare_command(self, command: list[str]) -> tuple[list[str], dict]:
+    def _prepare_command(self, command: list[str], env: dict | None = None) -> tuple[list[str], dict]:
         if not command:
             raise FileNotFoundError("empty command")
         info = self.resolve_command(command[0])
@@ -460,7 +461,16 @@ class HostRuntime:
             # development machine does not provide host-only commands like xprop.
             return command, info
         if info["via_host"]:
-            return ["flatpak-spawn", "--host", *command], info
+            forwarded_env = []
+            if env:
+                for key, value in env.items():
+                    if value is None:
+                        continue
+                    text_value = str(value)
+                    if "\x00" in text_value or "\n" in text_value:
+                        continue
+                    forwarded_env.append(f"--env={key}={text_value}")
+            return ["flatpak-spawn", "--host", *forwarded_env, *command], info
         return command, info
 
     def run(
@@ -473,7 +483,7 @@ class HostRuntime:
         text: bool = True,
         input: str | None = None,
     ) -> subprocess.CompletedProcess:
-        final_command, _info = self._prepare_command(command)
+        final_command, _info = self._prepare_command(command, env)
         return subprocess.run(
             final_command,
             capture_output=capture_output,
@@ -547,8 +557,14 @@ class SteamOsManagerClient:
 
     def _run_busctl(self, bus: str, args: list[str]) -> subprocess.CompletedProcess:
         env = self.user_bus_env if bus == "user" else self.runtime.host_env()
+        command = ["busctl", f"--{bus}"]
+        # `busctl` treats values like `-1` as options unless we terminate option
+        # parsing before the positional DBus arguments.
+        if any(str(arg).startswith("-") for arg in args):
+            command.append("--")
+        command.extend(args)
         return self.runtime.run(
-            ["busctl", f"--{bus}", *args],
+            command,
             timeout=5,
             env=env,
         )
@@ -588,7 +604,7 @@ class SteamOsManagerClient:
                 interfaces.setdefault(current_interface, set())
                 continue
             if parts[1] == "property" and current_interface:
-                interfaces.setdefault(current_interface, set()).add(parts[0])
+                interfaces.setdefault(current_interface, set()).add(parts[0].lstrip("."))
         return interfaces
 
     def _find_interface_bus(self, interface: str) -> str:
@@ -1022,11 +1038,10 @@ class GamescopeSettingsClient:
             GAMESCOPE_ALLOW_TEARING_ATOM
         )
 
-        vrr_capable = (
-            (vrr_capable_ok and bool(vrr_capable_value))
-            or vrr_enabled_ok
-            or vrr_feedback_ok
-        )
+        if vrr_capable_ok:
+            vrr_capable = bool(vrr_capable_value)
+        else:
+            vrr_capable = vrr_enabled_ok or vrr_feedback_ok
         vrr_enabled = vrr_enabled_ok and bool(vrr_enabled_value)
         vrr_active = vrr_feedback_ok and bool(vrr_feedback_value)
 
@@ -1125,8 +1140,28 @@ class Plugin:
         self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
         self.gamescope_settings = GamescopeSettingsClient(decky.logger, self.runtime)
         await self.load_settings()
+        privilege_state = self._get_privilege_state()
         decky.logger.info(f"{PLUGIN_NAME} initialized")
+        decky.logger.info(
+            "Backend privilege state: "
+            f"user={privilege_state['user'] or 'unknown'} "
+            f"euid={privilege_state['effective_uid']} "
+            f"root={privilege_state['is_root']} "
+            f"sudo={privilege_state['sudo_noninteractive']} "
+            f"writes={privilege_state['system_write_access']}"
+        )
+        if not privilege_state["system_write_access"]:
+            decky.logger.warning(
+                "Protected writes are unavailable; Decky did not launch the backend "
+                "with effective root access and passwordless sudo is unavailable"
+            )
         self._debug_success("plugin", "init", f"{PLUGIN_NAME} initialized")
+        self._debug_success(
+            "plugin",
+            "privileges",
+            "Backend privilege state collected",
+            privilege_state,
+        )
 
     async def _unload(self):
         """Cleanup when plugin is unloaded"""
@@ -1261,6 +1296,35 @@ class Plugin:
             "backend": device.get("backend", "hid"),
         }
 
+    def _normalize_hid_path(self, path) -> str:
+        if isinstance(path, bytes):
+            try:
+                return path.decode("utf-8", errors="ignore")
+            except Exception:
+                return ""
+        return str(path or "")
+
+    def _hid_raw_path_accessible(self, path) -> bool:
+        normalized_path = self._normalize_hid_path(path)
+        return bool(normalized_path) and os.path.exists(normalized_path) and os.access(normalized_path, os.W_OK)
+
+    def _hid_device_accessible(self, device: dict) -> bool:
+        path = self._normalize_hid_path(device.get("path"))
+        if self._hid_raw_path_accessible(path):
+            return True
+
+        hid_device = self._open_hid_module_device(path, warn=False)
+        if hid_device is None:
+            return False
+
+        close = getattr(hid_device, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return True
+
     def _legion_hid_candidates(self) -> list[dict]:
         return [self._normalize_hid_device(device) for device in self._hid_module_devices()] + self._hidraw_devices()
 
@@ -1285,27 +1349,68 @@ class Plugin:
                     return {**device, "config": config}
         return None
 
-    def _get_asus_hid_rgb_device(self) -> dict | None:
-        for device in self._legion_hid_candidates():
-            if self._hid_device_matches_config(device, ASUS_ALLY_HID):
-                return {**device, "config": ASUS_ALLY_HID}
-        return None
+    def _has_asus_wmi(self) -> bool:
+        return os.path.exists(ASUS_WMI_PATH)
 
-    def _get_rgb_backend(self) -> dict:
-        asus_device = self._get_asus_hid_rgb_device()
-        if asus_device:
+    def _get_asus_charge_limit_state(self) -> dict | None:
+        if not os.path.exists(ASUS_CHARGE_LIMIT_PATH):
+            return None
+
+        try:
+            with open(ASUS_CHARGE_LIMIT_PATH, "r") as f:
+                raw_limit = int((f.read().strip() or "100"))
+        except Exception as e:
             return {
-                "type": "asus_hid",
-                "device": asus_device,
-                "details": asus_device["config"]["name"],
+                "available": False,
+                "enabled": False,
+                "limit": STEAMOS_CHARGE_FULL_PERCENT,
+                "status": str(e),
+                "details": "Failed to read ASUS WMI battery charge limit",
             }
 
+        limit = max(60, min(STEAMOS_CHARGE_FULL_PERCENT, raw_limit))
+        enabled = limit < STEAMOS_CHARGE_FULL_PERCENT
+        return {
+            "available": True,
+            "enabled": enabled,
+            "limit": limit,
+            "raw_limit": raw_limit,
+            "suggested_minimum": 80,
+            "status": "available",
+            "details": "Controls battery charge limit through ASUS WMI",
+        }
+
+    def _set_asus_charge_limit_enabled(self, enabled: bool) -> tuple[bool, str]:
+        if not os.path.exists(ASUS_CHARGE_LIMIT_PATH):
+            return False, "ASUS WMI charge limit is unavailable"
+
+        value = "80" if enabled else str(STEAMOS_CHARGE_FULL_PERCENT)
+        return self._write_file(ASUS_CHARGE_LIMIT_PATH, value, use_sudo=True)
+
+    def _set_asus_mcu_powersave(self, enabled: bool) -> tuple[bool, str]:
+        if not os.path.exists(ASUS_MCU_POWERSAVE_PATH):
+            return False, "ASUS MCU powersave is unavailable"
+        return self._write_file(
+            ASUS_MCU_POWERSAVE_PATH,
+            "1" if enabled else "0",
+            use_sudo=True,
+        )
+
+    def _get_rgb_backend(self) -> dict:
         led_path = self._get_rgb_led_path()
+        if led_path == ALLY_LED_PATH and self._has_asus_wmi():
+            return {"type": "sysfs", "path": led_path, "details": "ASUS sysfs multicolor LED"}
+
         if led_path:
             return {"type": "sysfs", "path": led_path, "details": "sysfs multicolor LED"}
 
         device = self._get_legion_hid_rgb_device()
         if device:
+            if not self._hid_device_accessible(device):
+                return {
+                    "type": "none",
+                    "details": f"{device['config']['name']} detected, but the HID device is not writable from this Decky session",
+                }
             return {
                 "type": "legion_hid",
                 "device": device,
@@ -1810,54 +1915,6 @@ class Plugin:
     def _rgb_hid_padded(self, payload: list[int]) -> bytes:
         return rgb_hid_padded(payload)
 
-    def _asus_rgb_brightness_level(self, brightness: int) -> int:
-        normalized = self._normalize_rgb_brightness(brightness)
-        if normalized <= 0:
-            return 0x00
-        if normalized <= 33:
-            return 0x01
-        if normalized <= 66:
-            return 0x02
-        return 0x03
-
-    def _asus_rgb_config_command(self, boot: bool = False, charging: bool = False) -> bytes:
-        payload = [0x5A, 0xD1, 0x09, 0x01, 0x02 + (0x09 if boot else 0) + (0x04 if charging else 0)]
-        return bytes(payload) + bytes(max(0, 64 - len(payload)))
-
-    def _disable_asus_dynamic_lighting(self, device: dict) -> None:
-        if device.get("product_id") != 0x1B4C:
-            return
-        module = self._hid_module()
-        if module is None or not hasattr(module, "Device"):
-            return
-        try:
-            for candidate in self._hid_module_devices():
-                if candidate.get("vendor_id") != ASUS_ALLY_HID["vid"]:
-                    continue
-                if candidate.get("product_id") != 0x1B4C:
-                    continue
-                application = ((candidate.get("usage_page") or 0) << 16) | (candidate.get("usage") or 0)
-                if application != 0x00590001:
-                    continue
-                dyn_device = module.Device(path=candidate["path"])
-                dyn_device.write(bytes([0x06, 0x01]))
-                close = getattr(dyn_device, "close", None)
-                if callable(close):
-                    close()
-                break
-        except Exception:
-            pass
-
-    def _asus_hid_rgb_commands(
-        self,
-        color: str,
-        enabled: bool,
-        brightness: int = RGB_DEFAULT_BRIGHTNESS,
-        mode: str = RGB_DEFAULT_MODE,
-        speed: str = RGB_DEFAULT_SPEED,
-    ) -> list[bytes]:
-        return asus_hid_rgb_commands(color, enabled, brightness, mode, speed)
-
     def _legion_hid_rgb_commands(
         self,
         device: dict,
@@ -1869,19 +1926,21 @@ class Plugin:
     ) -> list[bytes]:
         return legion_hid_rgb_commands(device, color, enabled, brightness, mode, speed)
 
-    def _open_hid_module_device(self, path):
+    def _open_hid_module_device(self, path, warn: bool = True):
         module = self._hid_module()
         if module is None:
             return None
         try:
+            normalized_path = self._normalize_hid_path(path)
             if hasattr(module, "Device"):
-                return module.Device(path=path)
+                return module.Device(path=normalized_path)
             if hasattr(module, "device"):
                 device = module.device()
-                device.open_path(path)
+                device.open_path(normalized_path)
                 return device
         except Exception as e:
-            decky.logger.warning(f"Failed to open HID device: {e}")
+            if warn:
+                decky.logger.warning(f"Failed to open HID device: {e}")
         return None
 
     def _write_hid_rgb(
@@ -1910,12 +1969,10 @@ class Plugin:
         if not commands:
             return False
 
-        if backend["type"] == "asus_hid":
-            self._disable_asus_dynamic_lighting(device)
-
+        device_path = self._normalize_hid_path(device.get("path"))
         if device.get("backend") == "hidraw":
             try:
-                with open(device["path"], "wb", buffering=0) as f:
+                with open(device_path, "wb", buffering=0) as f:
                     for command in commands:
                         f.write(command)
                 return True
@@ -1923,8 +1980,16 @@ class Plugin:
                 decky.logger.warning(f"Failed to write HID raw RGB command: {e}")
                 return False
 
-        hid_device = self._open_hid_module_device(device.get("path"))
+        hid_device = self._open_hid_module_device(device_path)
         if hid_device is None:
+            if self._hid_raw_path_accessible(device_path):
+                try:
+                    with open(device_path, "wb", buffering=0) as f:
+                        for command in commands:
+                            f.write(command)
+                    return True
+                except Exception as e:
+                    decky.logger.warning(f"Failed to write HID raw RGB command: {e}")
             return False
 
         try:
@@ -1942,13 +2007,62 @@ class Plugin:
         return await self._get_rgb_controller().get_state()
 
     async def set_rgb_enabled(self, enabled: bool) -> bool:
-        return await self._get_rgb_controller().set_enabled(enabled)
+        success = await self._get_rgb_controller().set_enabled(enabled)
+        if not success:
+            return False
+
+        backend = self._get_rgb_backend()
+        if self._has_asus_wmi() and backend["type"] == "sysfs" and backend.get("path") == ALLY_LED_PATH:
+            powersave_ok, powersave_error = self._set_asus_mcu_powersave(not enabled)
+            if not powersave_ok:
+                decky.logger.warning(
+                    f"Failed to sync ASUS MCU powersave with RGB state: {powersave_error}"
+                )
+                self._debug_failure(
+                    "rgb",
+                    "set_enabled_aux",
+                    f"Failed to sync ASUS MCU powersave: {powersave_error}",
+                    {"enabled": enabled},
+                )
+            else:
+                self._debug_success(
+                    "rgb",
+                    "set_enabled_aux",
+                    "ASUS MCU powersave synced",
+                    {"enabled": enabled, "mcu_powersave": not enabled},
+                )
+        return True
 
     async def set_rgb_color(self, color: str) -> bool:
         return await self._get_rgb_controller().set_color(color)
 
     async def set_rgb_brightness(self, brightness: int) -> bool:
         return await self._get_rgb_controller().set_brightness(brightness)
+
+    async def set_rgb_effect(self, effect: str) -> bool:
+        normalized = str(effect or "").strip().lower()
+
+        if normalized == "off":
+            return await self.set_rgb_enabled(False)
+
+        if normalized == "static":
+            if not await self.set_rgb_mode("solid"):
+                return False
+            return await self.set_rgb_enabled(True)
+
+        mode_map = {
+            "pulse": "pulse",
+            "spectrum": "rainbow",
+            "wave": "spiral",
+            "flash": "pulse",
+            "battery": "solid",
+        }
+        target_mode = mode_map.get(normalized)
+        if not target_mode:
+            return False
+        if not await self.set_rgb_mode(target_mode):
+            return False
+        return await self.set_rgb_enabled(True)
 
     async def set_rgb_mode(self, mode: str) -> bool:
         return await self._get_rgb_controller().set_mode(mode)
@@ -2170,8 +2284,12 @@ class Plugin:
 
         return True, ""
 
-    def _run_command_output(self, command: list[str]) -> tuple[bool, str]:
+    def _run_command_output(self, command: list[str], use_sudo: bool = False) -> tuple[bool, str]:
         try:
+            if use_sudo:
+                success, error = self._run_command(command, use_sudo=True)
+                return success, "" if success else error
+
             result = self.runtime.run(
                 command,
                 timeout=20,
@@ -2228,10 +2346,29 @@ class Plugin:
             return True
         return self._has_noninteractive_sudo()
 
+    def _get_privilege_state(self) -> dict:
+        user = (
+            os.environ.get("USER")
+            or os.environ.get("LOGNAME")
+            or os.environ.get("USERNAME")
+            or ""
+        )
+        effective_uid = os.geteuid()
+        is_root = effective_uid == 0
+        sudo_noninteractive = True if is_root else self._has_noninteractive_sudo()
+        system_write_access = True if is_root else sudo_noninteractive
+        return {
+            "user": user,
+            "effective_uid": effective_uid,
+            "is_root": is_root,
+            "sudo_noninteractive": sudo_noninteractive,
+            "system_write_access": system_write_access,
+        }
+
     def _optimization_runtime_details(self) -> str:
         if self._system_write_access_available():
             return ""
-        return "System writes require root or passwordless sudo; the current Decky backend cannot elevate non-interactively"
+        return "System writes require real root access or passwordless sudo; this Decky session is not running with enough host privileges to apply optimization changes"
 
     def _get_fps_presets(self) -> list[int]:
         presets = list(FPS_NATIVE_PRESET_VALUES)
@@ -2497,6 +2634,7 @@ done < "$CONFIG_PATH"
         enabled: bool,
         active: bool,
         available: bool = True,
+        mutable: bool = True,
         needs_reboot: bool = False,
         details: str = "",
         risk_note: str = "",
@@ -2508,6 +2646,7 @@ done < "$CONFIG_PATH"
             enabled,
             active,
             available,
+            mutable,
             needs_reboot,
             details,
             risk_note,
@@ -2515,6 +2654,7 @@ done < "$CONFIG_PATH"
 
     def _get_lavd_state(self) -> dict:
         runtime_details = self._optimization_runtime_details()
+        writable = self._system_write_access_available()
         configured = self._file_contains_all(
             SCX_DEFAULT_PATH,
             ['SCX_SCHEDULER="scx_lavd"', 'SCX_FLAGS="--performance"'],
@@ -2531,12 +2671,14 @@ done < "$CONFIG_PATH"
             enabled,
             service_active,
             available=self._command_exists("systemctl") and self._service_exists("scx.service"),
+            mutable=writable,
             details=("SteamOS scx.service" if self._service_exists("scx.service") else "scx.service unavailable") + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Touches a system service.",
         )
 
     def _get_swap_protect_state(self) -> dict:
         runtime_details = self._optimization_runtime_details()
+        writable = self._system_write_access_available()
         configured = self._file_contains_all(
             MEMORY_SYSCTL_PATH,
             ["vm.swappiness = 10", "vm.min_free_kbytes = 524288", "vm.dirty_ratio = 5"],
@@ -2556,6 +2698,7 @@ done < "$CONFIG_PATH"
             enabled,
             runtime,
             available=self._command_exists("sysctl"),
+            mutable=writable,
             needs_reboot=(enabled and not runtime) or (not enabled and runtime),
             details="swappiness 10, min_free_kbytes 524288, dirty_ratio 5" + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Runtime sysctl values may remain until they are reloaded.",
@@ -2563,6 +2706,7 @@ done < "$CONFIG_PATH"
 
     def _get_thp_madvise_state(self) -> dict:
         runtime_details = self._optimization_runtime_details()
+        writable = self._system_write_access_available()
         configured = self._file_contains_all(THP_TMPFILES_PATH, ["madvise"])
         atomic = self._atomic_manifest_contains([THP_TMPFILES_PATH])
         enabled = configured and atomic
@@ -2575,6 +2719,7 @@ done < "$CONFIG_PATH"
             enabled,
             runtime,
             available=os.path.exists(THP_ENABLED_PATH),
+            mutable=writable,
             needs_reboot=(enabled and not runtime) or (not enabled and runtime),
             details="Transparent Huge Pages mode: madvise" + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Some games prefer different THP behavior.",
@@ -2582,6 +2727,7 @@ done < "$CONFIG_PATH"
 
     def _get_npu_blacklist_state(self) -> dict:
         runtime_details = self._optimization_runtime_details()
+        writable = self._system_write_access_available()
         configured = self._file_contains_all(NPU_BLACKLIST_PATH, ["blacklist amdxdna"])
         atomic = self._atomic_manifest_contains([NPU_BLACKLIST_PATH])
         enabled = configured and atomic
@@ -2595,6 +2741,7 @@ done < "$CONFIG_PATH"
             enabled,
             enabled and not module_loaded,
             available=self._is_amd_platform() and (npu_present or configured),
+            mutable=writable,
             needs_reboot=enabled and module_loaded,
             details="Module: amdxdna" + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Requires reboot when the module is already loaded.",
@@ -2602,6 +2749,7 @@ done < "$CONFIG_PATH"
 
     def _get_usb_wake_state(self) -> dict:
         runtime_details = self._optimization_runtime_details()
+        writable = self._system_write_access_available()
         service_name = self._usb_wake_service_name()
         service_configured = self._host_file_exists(USB_WAKE_SERVICE_PATH)
         script_configured = self._host_file_exists(USB_WAKE_SCRIPT_PATH)
@@ -2637,12 +2785,14 @@ done < "$CONFIG_PATH"
             enabled,
             service_active and runtime_active,
             available=available,
+            mutable=writable,
             details=details,
             risk_note="Touches ACPI wake sources and a managed systemd unit.",
         )
 
     def _get_kernel_param_state(self, key: str, option: dict) -> dict:
         runtime_details = self._optimization_runtime_details()
+        writable = self._system_write_access_available()
         param = option["param"]
         configured = self._grub_param_configured(param)
         atomic = self._atomic_manifest_contains([GRUB_DEFAULT_PATH])
@@ -2656,6 +2806,7 @@ done < "$CONFIG_PATH"
             enabled,
             active,
             available=self._host_file_exists(GRUB_DEFAULT_PATH) and self._is_amd_platform(),
+            mutable=writable,
             needs_reboot=(enabled and not active) or (not enabled and active),
             details=option["details"] + (f" | {runtime_details}" if runtime_details else ""),
             risk_note="Modifies boot configuration and requires reboot to become active.",
@@ -3015,7 +3166,15 @@ done < "$CONFIG_PATH"
                 support,
             )
 
-        return self._get_steamos_manager().get_charge_limit_state()
+        native_state = self._get_steamos_manager().get_charge_limit_state()
+        if native_state.get("available", False):
+            return native_state
+
+        asus_state = self._get_asus_charge_limit_state()
+        if asus_state is not None:
+            return asus_state
+
+        return native_state
 
     async def set_charge_limit_enabled(self, enabled: bool) -> bool:
         try:
@@ -3025,19 +3184,35 @@ done < "$CONFIG_PATH"
                 return False
 
             success, error = self._get_steamos_manager().set_charge_limit_enabled(enabled)
+            backend = "steamos_manager"
             if not success:
-                decky.logger.warning(f"Failed to set SteamOS charge limit: {error}")
-                self._debug_failure("power", "set_charge_limit", f"Failed to set SteamOS charge limit: {error}", {"enabled": enabled})
+                asus_state = self._get_asus_charge_limit_state()
+                if asus_state is not None:
+                    backend = "asus_wmi"
+                    success, error = self._set_asus_charge_limit_enabled(enabled)
+            if not success:
+                decky.logger.warning(f"Failed to set charge limit: {error}")
+                self._debug_failure(
+                    "power",
+                    "set_charge_limit",
+                    f"Failed to set charge limit: {error}",
+                    {"enabled": enabled, "backend": backend},
+                )
                 return False
 
             decky.logger.info(
-                f"SteamOS charge limit {'enabled' if enabled else 'disabled'}"
+                f"Charge limit {'enabled' if enabled else 'disabled'} via {backend}"
             )
-            self._debug_success("power", "set_charge_limit", "Battery charge limit updated", {"enabled": enabled})
+            self._debug_success(
+                "power",
+                "set_charge_limit",
+                "Battery charge limit updated",
+                {"enabled": enabled, "backend": backend},
+            )
             return True
         except Exception as e:
-            decky.logger.error(f"Failed to set SteamOS charge limit: {e}")
-            self._debug_failure("power", "set_charge_limit", f"Failed to set SteamOS charge limit: {e}", {"enabled": enabled})
+            decky.logger.error(f"Failed to set charge limit: {e}")
+            self._debug_failure("power", "set_charge_limit", f"Failed to set charge limit: {e}", {"enabled": enabled})
             return False
 
     async def get_smt_state(self) -> dict:
@@ -3256,6 +3431,7 @@ done < "$CONFIG_PATH"
         if self.steamos_manager is not None:
             steamos_bus = self.steamos_manager.get_active_bus()
         runtime_state["steamos_manager_bus"] = steamos_bus
+        runtime_state["privileges"] = self._get_privilege_state()
         return runtime_state
 
     async def get_dashboard_state(self) -> dict:

@@ -9,6 +9,9 @@ PLUGIN_DIR="$HOME/homebrew/plugins/$PLUGIN_NAME"
 REPO_OWNER="neokura"
 REPO_NAME="AnyDeck"
 REQUESTED_VERSION="${1:-${ANYDECK_VERSION:-}}"
+PLUGIN_LOADER_SERVICE_NAME="plugin_loader"
+PLUGIN_LOADER_OVERRIDE_DIR="/etc/systemd/system/${PLUGIN_LOADER_SERVICE_NAME}.service.d"
+PLUGIN_LOADER_OVERRIDE_FILE="${PLUGIN_LOADER_OVERRIDE_DIR}/90-anydeck-root.conf"
 
 TEMP_FILES=()
 cleanup() {
@@ -21,6 +24,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+PLUGIN_LOADER_UNIT="$HOME/homebrew/services/.systemd/plugin_loader.service"
+
 require_command() {
     local cmd="$1"
     local description="$2"
@@ -28,6 +33,67 @@ require_command() {
         echo "Error: $description is required but '$cmd' is not installed."
         exit 1
     fi
+}
+
+check_plugin_loader_root_mode() {
+    if [ ! -f "$PLUGIN_LOADER_UNIT" ]; then
+        echo "⚠ Could not inspect Decky service unit: $PLUGIN_LOADER_UNIT"
+        echo "  AnyDeck expects Decky to launch plugin backends with effective root access."
+        return 0
+    fi
+
+    if grep -Eq '^[[:space:]]*User=root[[:space:]]*$' "$PLUGIN_LOADER_UNIT"; then
+        echo "✓ Decky plugin_loader is configured with User=root"
+        return 0
+    fi
+
+    echo "⚠ Decky plugin_loader does not appear to run as User=root."
+    echo "  Protected writes may fail unless your setup provides passwordless sudo."
+    echo "  Check: $PLUGIN_LOADER_UNIT"
+    return 0
+}
+
+ensure_plugin_loader_root_mode() {
+    if grep -Eq '^[[:space:]]*User=root[[:space:]]*$' "$PLUGIN_LOADER_UNIT" 2>/dev/null; then
+        echo "✓ Decky plugin_loader is already configured with User=root"
+        return 0
+    fi
+
+    echo "Configuring Decky plugin_loader override for root backend access..."
+    sudo mkdir -p "$PLUGIN_LOADER_OVERRIDE_DIR"
+    sudo tee "$PLUGIN_LOADER_OVERRIDE_FILE" >/dev/null <<'EOF'
+[Service]
+User=root
+EOF
+
+    if command -v systemctl >/dev/null 2>&1; then
+        sudo systemctl daemon-reload
+        echo "✓ Installed systemd override: $PLUGIN_LOADER_OVERRIDE_FILE"
+    else
+        echo "⚠ systemctl is unavailable; created the override but could not reload systemd"
+    fi
+}
+
+verify_plugin_loader_effective_user() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "⚠ systemctl is unavailable; unable to verify plugin_loader effective user"
+        return 0
+    fi
+
+    local effective_user
+    effective_user="$(systemctl show "$PLUGIN_LOADER_SERVICE_NAME" -p User --value 2>/dev/null || true)"
+    if [ "$effective_user" = "root" ]; then
+        echo "✓ plugin_loader effective user is root"
+        return 0
+    fi
+
+    if [ -n "$effective_user" ]; then
+        echo "⚠ plugin_loader effective user is '$effective_user' instead of 'root'"
+    else
+        echo "⚠ Could not read plugin_loader effective user from systemd"
+    fi
+    echo "  AnyDeck may not be able to apply protected settings until Decky is relaunched in root mode."
+    return 0
 }
 
 fetch_release_metadata() {
@@ -124,6 +190,7 @@ echo ""
 require_command "curl" "curl"
 require_command "python3" "Python 3"
 require_command "unzip" "unzip"
+require_command "sudo" "sudo"
 
 if [[ "$OSTYPE" != "linux-gnu"* ]]; then
     echo "Error: This script is intended for Linux/SteamOS only."
@@ -170,6 +237,8 @@ echo ""
 echo "Creating plugin directory (requires sudo permission)..."
 sudo mkdir -p "$PLUGIN_DIR"
 sudo chown -R "$(id -un):$(id -gn)" "$PLUGIN_DIR"
+check_plugin_loader_root_mode
+ensure_plugin_loader_root_mode
 
 echo "Checking for a downloadable release..."
 mapfile -t RELEASE_METADATA < <(fetch_release_metadata)
@@ -228,11 +297,13 @@ echo "================================"
 echo ""
 echo "Plugin installed to: $PLUGIN_DIR"
 echo "Installed version: $SELECTED_VERSION"
+echo "Decky service unit: $PLUGIN_LOADER_UNIT"
 echo ""
 echo "Restarting Decky Loader..."
 
-if sudo systemctl restart plugin_loader 2>/dev/null; then
+if sudo systemctl restart "$PLUGIN_LOADER_SERVICE_NAME" 2>/dev/null; then
     echo "✓ Decky Loader restarted successfully!"
+    verify_plugin_loader_effective_user
     echo ""
     echo "Your plugin should now be available in the Quick Access menu."
 else

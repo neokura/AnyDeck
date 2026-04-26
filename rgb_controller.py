@@ -114,7 +114,7 @@ class RgbController:
             enabled, color, brightness = self.read_rgb_state_from_led(backend["path"])
             mode = self.get_saved_rgb_mode(backend)
             speed = self.normalize_rgb_speed(self._settings().get("rgb_speed", RGB_DEFAULT_SPEED))
-        elif backend["type"] in {"legion_hid", "asus_hid"}:
+        elif backend["type"] == "legion_hid":
             enabled, color, brightness, mode, speed = self._current_hid_state(backend)
         else:
             enabled, color, brightness = False, RGB_COLOR_PRESETS[0], RGB_DEFAULT_BRIGHTNESS
@@ -283,7 +283,7 @@ class RgbController:
 
         enabled, current_color, current_brightness, _current_mode, current_speed = self._current_hid_state(backend)
         success = True
-        if backend["type"] in {"legion_hid", "asus_hid"} and enabled:
+        if backend["type"] == "legion_hid" and enabled:
             success = self.write_hid_rgb(
                 backend,
                 current_color,
@@ -324,7 +324,7 @@ class RgbController:
 
         enabled, current_color, current_brightness, _mode, _speed = self._current_hid_state(backend)
         success = True
-        if backend["type"] in {"legion_hid", "asus_hid"} and enabled:
+        if backend["type"] == "legion_hid" and enabled:
             success = self.write_hid_rgb(
                 backend,
                 current_color,

@@ -3,6 +3,7 @@ import {
   PanelSection,
   PanelSectionRow,
   DialogButton,
+  DropdownItem,
   Focusable,
   SliderField,
   ToggleField,
@@ -50,6 +51,16 @@ const RGB_SPEED_DESCRIPTIONS: Record<string, string> = {
   medium: "Default native cadence",
   high: "Fastest native animation",
 };
+const RGB_EFFECTS = [
+  { data: "static", label: "Static" },
+  { data: "pulse", label: "Pulse" },
+  { data: "spectrum", label: "Spectrum" },
+  { data: "wave", label: "Wave" },
+  { data: "flash", label: "Flash" },
+  { data: "battery", label: "Battery Level" },
+  { data: "off", label: "Off" },
+];
+const RGB_ANIMATED_EFFECTS = ["pulse", "spectrum", "wave", "flash"];
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.max(min, Math.min(max, value));
@@ -121,6 +132,34 @@ const hexToHue = (color: string): number => {
   return Math.round((hue + 360) % 360);
 };
 
+const rgbStateToEffect = (rgb?: RgbState | null): string => {
+  if (!rgb?.enabled) {
+    return "off";
+  }
+
+  switch (rgb.mode) {
+    case "pulse":
+      return "pulse";
+    case "rainbow":
+      return "spectrum";
+    case "spiral":
+      return "wave";
+    default:
+      return "static";
+  }
+};
+
+const rgbSpeedToSliderValue = (speed?: string): number => {
+  switch ((speed || "").toLowerCase()) {
+    case "low":
+      return 20;
+    case "high":
+      return 100;
+    default:
+      return 50;
+  }
+};
+
 const getDashboardState = callable<[], DashboardState>("get_dashboard_state");
 const getOptimizationStates = callable<[], OptimizationData>(
   "get_optimization_states"
@@ -141,6 +180,7 @@ const setSmtEnabled = callable<[boolean], boolean>("set_smt_enabled");
 const setRgbEnabled = callable<[boolean], boolean>("set_rgb_enabled");
 const setRgbColor = callable<[string], boolean>("set_rgb_color");
 const setRgbBrightness = callable<[number], boolean>("set_rgb_brightness");
+const setRgbEffect = callable<[string], boolean>("set_rgb_effect");
 const setRgbMode = callable<[string], boolean>("set_rgb_mode");
 const setRgbSpeed = callable<[string], boolean>("set_rgb_speed");
 const setDisplaySyncSetting = callable<[string, boolean], boolean>(
@@ -235,6 +275,7 @@ interface OptimizationState {
   enabled: boolean;
   active: boolean;
   available: boolean;
+  mutable?: boolean;
   needs_reboot: boolean;
   details: string;
   risk_note: string;
@@ -320,6 +361,13 @@ interface InformationState {
     execution_backend: "direct" | "flatpak-host";
     os_release_path: string;
     host_os_id: string;
+    privileges: {
+      user: string;
+      effective_uid: number;
+      is_root: boolean;
+      sudo_noninteractive: boolean;
+      system_write_access: boolean;
+    };
     commands: Record<
       string,
       {
@@ -498,6 +546,13 @@ const actionButtonRowStyle: React.CSSProperties = {
   width: "100%",
 };
 
+const stackedActionButtonGroupStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "minmax(0, 1fr)",
+  gap: "8px",
+  width: "100%",
+};
+
 const actionButtonCellStyle: React.CSSProperties = {
   flex: "1 1 0",
   minWidth: 0,
@@ -611,6 +666,19 @@ const formatFpsReadout = (state: FpsLimitState): string => {
     return `Current limit: ${formatFpsLabel(state.current)}`;
   }
   return state.details;
+};
+
+const compactPerformanceDescription = (modeId: string): string => {
+  switch (modeId) {
+    case "low-power":
+      return "Cool and quiet";
+    case "balanced":
+      return "Everyday play";
+    case "performance":
+      return "Higher performance";
+    default:
+      return "Performance mode";
+  }
 };
 
 const PerformanceModeGlyph: VFC<{ modeId: string; active: boolean }> = ({
@@ -986,7 +1054,7 @@ const DashboardView: VFC<{
             <NativeOptionButton
               key={mode.id}
               title={mode.label}
-              description={mode.description}
+              description={compactPerformanceDescription(mode.id)}
               status={mode.active ? "Active" : mode.available ? "Ready" : "Unavailable"}
               active={mode.active}
               disabled={!mode.available || controlsDisabled}
@@ -1090,7 +1158,7 @@ const DashboardView: VFC<{
       </PanelSectionRow>
 
       <PanelSectionRow>
-        <div style={actionButtonRowStyle}>
+        <div style={stackedActionButtonGroupStyle}>
           <SecondaryActionButton label="RGB" onClick={onOpenRgb} />
           <SecondaryActionButton label="Optimizations" onClick={onOpenOptimizations} />
           <SecondaryActionButton label="Information" onClick={onOpenInformation} />
@@ -1216,7 +1284,12 @@ const OptimizationsView: VFC<{
                 label="Enable Available Optimizations"
                 disabled={
                   controlsDisabled ||
-                  !data.states.some((optimization) => optimization.available && !optimization.enabled)
+                  !data.states.some(
+                    (optimization) =>
+                      optimization.available &&
+                      optimization.mutable !== false &&
+                      !optimization.enabled
+                  )
                 }
                 onClick={handleEnableAvailable}
               />
@@ -1226,9 +1299,9 @@ const OptimizationsView: VFC<{
             <PanelSectionRow key={optimization.key}>
               <ToggleField
                 label={`${optimization.name}: ${optimization.status}`}
-                description={`${optimization.description} ${optimization.needs_reboot ? "Reboot required. " : ""}${optimization.risk_note}`.trim()}
+                description={`${optimization.description} ${optimization.details ? `${optimization.details}. ` : ""}${optimization.needs_reboot ? "Reboot required. " : ""}${optimization.risk_note}`.trim()}
                 checked={optimization.enabled}
-                disabled={!optimization.available || controlsDisabled}
+                disabled={!optimization.available || optimization.mutable === false || controlsDisabled}
                 onChange={(enabled: boolean) =>
                   handleOptimizationToggle(optimization, enabled)
                 }
@@ -1254,45 +1327,20 @@ const RGBView: VFC<{
   const rgb = data?.rgb;
   const rgbPresets = rgb?.presets?.length ? rgb.presets : RGB_PRESETS;
   const normalizedColor = normalizeHexColor(rgb?.color ?? rgbPresets[0]);
-  const [selectedColor, setSelectedColor] = useState<string>(normalizedColor);
-  const [hueValue, setHueValue] = useState<number>(hexToHue(normalizedColor));
-  const [brightnessValue, setBrightnessValue] = useState<number>(
-    clamp(rgb?.brightness ?? 100, 0, 100)
-  );
-  const [selectedMode, setSelectedMode] = useState<string>(rgb?.mode ?? "solid");
-  const [selectedSpeed, setSelectedSpeed] = useState<string>(rgb?.speed ?? "medium");
-  const activeColor = selectedColor;
-  const supportedModes = rgb?.supported_modes?.length ? rgb.supported_modes : ["solid"];
-  const currentModeCapabilities = rgb?.mode_capabilities?.[selectedMode] ?? {
-    color: true,
-    brightness: true,
-    speed: false,
-  };
   const canToggleRgb = Boolean(rgb?.capabilities?.toggle ?? rgb?.available);
-  const canAdjustColor = Boolean(currentModeCapabilities.color && (rgb?.supports_free_color ?? true));
-  const canAdjustBrightness = Boolean(currentModeCapabilities.brightness && (rgb?.brightness_available ?? true));
-  const canAdjustSpeed = Boolean(currentModeCapabilities.speed && (rgb?.speed_available ?? true));
-  const controlScopeLabel = rgb?.enabled ? "Live output" : "Next output on enable";
-  const controlScopeDescription = rgb?.enabled
-    ? "Changes apply immediately."
-    : "HueSync-style staging: these values are saved now and applied when RGB is turned back on.";
+  const canAdjustColor = Boolean(rgb?.capabilities?.color ?? rgb?.supports_free_color ?? rgb?.available);
+  const canAdjustBrightness = Boolean(rgb?.capabilities?.brightness ?? rgb?.brightness_available ?? rgb?.available);
+  const currentEffectValue = rgbStateToEffect(rgb);
+  const [hueValue, setHueValue] = useState<number>(hexToHue(normalizedColor));
+  const [currentEffect, setCurrentEffect] = useState<string>(currentEffectValue);
 
   useEffect(() => {
-    setSelectedColor(normalizedColor);
     setHueValue(hexToHue(normalizedColor));
   }, [normalizedColor]);
 
   useEffect(() => {
-    setBrightnessValue(clamp(rgb?.brightness ?? 100, 0, 100));
-  }, [rgb?.brightness]);
-
-  useEffect(() => {
-    setSelectedMode(rgb?.mode ?? "solid");
-  }, [rgb?.mode]);
-
-  useEffect(() => {
-    setSelectedSpeed(rgb?.speed ?? "medium");
-  }, [rgb?.speed]);
+    setCurrentEffect(currentEffectValue);
+  }, [currentEffectValue]);
 
   const runAction = async (
     actionKey: string,
@@ -1318,7 +1366,7 @@ const RGBView: VFC<{
     }
   };
 
-  const handleRgbToggle = async (enabled: boolean) => {
+  const handleToggle = async (enabled: boolean) => {
     await runAction(
       "rgb-toggle",
       () => setRgbEnabled(enabled),
@@ -1327,8 +1375,11 @@ const RGBView: VFC<{
     );
   };
 
-  const handleRgbColor = async (color: string) => {
-    const normalized = normalizeHexColor(color);
+  const handleHueChange = async (value: number) => {
+    const normalizedHue = clamp(value, 0, 360);
+    setHueValue(normalizedHue);
+    const nextColor = hueToHex(normalizedHue);
+    const normalized = normalizeHexColor(nextColor);
     await runAction(
       `rgb:${normalized}`,
       () => setRgbColor(normalized),
@@ -1337,7 +1388,18 @@ const RGBView: VFC<{
     );
   };
 
-  const handleRgbBrightness = async (brightness: number) => {
+  const handlePresetColor = async (color: string) => {
+    const normalized = normalizeHexColor(color);
+    setHueValue(hexToHue(normalized));
+    await runAction(
+      `rgb:${normalized}`,
+      () => setRgbColor(normalized),
+      `RGB color: ${RGB_PRESET_LABELS[normalized] || normalized}`,
+      "Could not change the RGB color"
+    );
+  };
+
+  const handleBrightnessChange = async (brightness: number) => {
     const normalized = clamp(brightness, 0, 100);
     await runAction(
       `rgb-brightness:${normalized}`,
@@ -1347,16 +1409,19 @@ const RGBView: VFC<{
     );
   };
 
-  const handleRgbMode = async (mode: string) => {
+  const handleEffectChange = async (effect: { data: string; label: string }) => {
+    setCurrentEffect(effect.data);
     await runAction(
-      `rgb-mode:${mode}`,
-      () => setRgbMode(mode),
-      `RGB mode: ${RGB_MODE_LABELS[mode] || mode}`,
-      "Could not change RGB mode"
+      `rgb-effect:${effect.data}`,
+      () => setRgbEffect(effect.data),
+      `RGB effect: ${effect.label}`,
+      "Could not change RGB effect"
     );
   };
 
-  const handleRgbSpeed = async (speed: string) => {
+  const handleSpeedChange = async (speedValue: number) => {
+    const speed =
+      speedValue <= 33 ? "low" : speedValue <= 66 ? "medium" : "high";
     await runAction(
       `rgb-speed:${speed}`,
       () => setRgbSpeed(speed),
@@ -1402,262 +1467,49 @@ const RGBView: VFC<{
             </PanelSection>
           )}
 
-          <PanelSection title="RGB">
+          <PanelSection title="RGB Lighting">
             <PanelSectionRow>
               <ToggleField
-                label={`RGB: ${rgb.enabled ? "enabled" : "disabled"}`}
-                description={rgb.enabled ? rgb.details : `${rgb.details}. ${controlScopeDescription}`}
+                label="Enable RGB"
+                description={rgb.details}
                 checked={rgb.enabled}
                 disabled={!canToggleRgb || controlsDisabled}
-                onChange={handleRgbToggle}
+                onChange={handleToggle}
               />
             </PanelSectionRow>
 
-            <PanelSectionRow>
-              <div style={cardStyle}>
-                <div style={rgbHeroStyle(rgb.enabled, activeColor)}>
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: "12px" }}>
-                    <div>
-                      <div style={{ color: "#ffffff", fontSize: "15px", fontWeight: 700 }}>
-                        {rgb.enabled ? "Lighting Enabled" : "Lighting Disabled"}
-                      </div>
-                      <div style={{ ...subtextStyle, color: "rgba(255,255,255,0.8)" }}>
-                        {controlScopeLabel}
-                      </div>
-                      <div style={{ ...subtextStyle, color: "rgba(255,255,255,0.8)" }}>
-                        {RGB_MODE_LABELS[selectedMode] || selectedMode}
-                      </div>
-                    </div>
-                    <div
-                      style={{
-                        color: rgb.enabled ? "#ffffff" : "#cbd5e1",
-                        fontSize: "12px",
-                        fontWeight: 700,
-                        textAlign: "right",
-                      }}
-                    >
-                      {RGB_PRESET_LABELS[activeColor] || activeColor}
-                      <div style={{ marginTop: "4px", fontSize: "11px", fontWeight: 600 }}>
-                        {brightnessValue}%
-                      </div>
-                    </div>
-                  </div>
-
-                  <div style={rgbSwatchStripStyle}>
+            {rgb.enabled && (
+              <div>
+                <PanelSectionRow>
+                  <SliderField
+                    label="Color"
+                    value={hueValue}
+                    min={0}
+                    max={360}
+                    step={5}
+                    disabled={!canAdjustColor || controlsDisabled}
+                    onChange={handleHueChange}
+                    showValue={false}
+                  />
+                </PanelSectionRow>
+                <PanelSectionRow>
+                  <div style={rgbHueRailStyle} />
+                </PanelSectionRow>
+                <PanelSectionRow>
+                  <div style={rgbQuickSwatchGridStyle}>
                     {rgbPresets.map((color) => (
-                      <div
-                        key={color}
-                        style={{
-                          height: "18px",
-                          borderRadius: "999px",
-                          background: color,
-                          border:
-                            color === activeColor
-                              ? "2px solid rgba(255,255,255,0.95)"
-                              : "1px solid rgba(255,255,255,0.28)",
-                          boxShadow:
-                            rgb.enabled && color === activeColor
-                              ? `0 0 18px ${color}`
-                              : "none",
-                        }}
-                      />
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </PanelSectionRow>
-
-            <PanelSectionRow>
-              <div style={cardStyle}>
-                <div style={viewTitleStyle}>Mode</div>
-                <div style={subtextStyle}>
-                  Native RGB modes where hardware exposes them. Legion HID and ASUS HID can use
-                  `pulse`, `rainbow`, and `spiral`; sysfs stays on clean `solid`.
-                </div>
-                <div style={optionGridStyle}>
-                  {supportedModes.map((mode) => {
-                    const active = selectedMode === mode;
-                    return (
-                      <NativeOptionButton
-                        key={mode}
-                        title={RGB_MODE_LABELS[mode] || mode}
-                        description={
-                          mode === "solid"
-                            ? "Static color"
-                            : mode === "pulse"
-                              ? "Native breathing effect"
-                              : mode === "spiral"
-                                ? "Native rotating effect"
-                                : "Native cycling effect"
-                        }
-                        status={active ? "Selected" : "Available"}
-                        active={active}
-                        disabled={controlsDisabled}
-                        onClick={() => {
-                          if (mode === selectedMode) {
-                            return;
-                          }
-                          setSelectedMode(mode);
-                          void handleRgbMode(mode);
-                        }}
-                      />
-                    );
-                  })}
-                </div>
-              </div>
-            </PanelSectionRow>
-
-            <PanelSectionRow>
-              <div style={cardStyle}>
-                <div style={viewTitleStyle}>Fine Control</div>
-                <div style={subtextStyle}>{controlScopeDescription}</div>
-              </div>
-            </PanelSectionRow>
-
-            <PanelSectionRow>
-              <SliderField
-                label={`Hue: ${RGB_PRESET_LABELS[activeColor] || activeColor}`}
-                description={
-                  canAdjustColor
-                    ? rgb.enabled
-                      ? "Free color selection across the full spectrum"
-                      : "Choose the next color before enabling RGB"
-                    : rgb.details
-                }
-                value={hueValue}
-                min={0}
-                max={360}
-                step={5}
-                disabled={!canAdjustColor || controlsDisabled}
-                showValue={false}
-                notchCount={7}
-                notchTicksVisible
-                validValues="range"
-                notchLabels={[
-                  "Red",
-                  "Yellow",
-                  "Green",
-                  "Cyan",
-                  "Blue",
-                  "Magenta",
-                  "Red",
-                ].map((label, notchIndex) => ({
-                  notchIndex,
-                  label,
-                  value: notchIndex * 60,
-                }))}
-                onChange={(value: number) => {
-                  const normalizedHue = clamp(value, 0, 360);
-                  const nextColor = hueToHex(normalizedHue);
-                  if (nextColor === activeColor) {
-                    return;
-                  }
-                  setHueValue(normalizedHue);
-                  setSelectedColor(nextColor);
-                  void handleRgbColor(nextColor);
-                }}
-              />
-            </PanelSectionRow>
-            <PanelSectionRow>
-              <div style={rgbHueRailStyle} />
-            </PanelSectionRow>
-
-            <PanelSectionRow>
-              <SliderField
-                label={`Brightness: ${brightnessValue}%`}
-                description={
-                  canAdjustBrightness
-                    ? "Shared intensity model normalized to 0-100 across supported devices"
-                    : rgb.details
-                }
-                value={brightnessValue}
-                min={0}
-                max={100}
-                step={5}
-                disabled={!canAdjustBrightness || controlsDisabled}
-                showValue={false}
-                notchCount={6}
-                notchTicksVisible
-                validValues="range"
-                notchLabels={[0, 20, 40, 60, 80, 100].map((value, notchIndex) => ({
-                  notchIndex,
-                  label: `${value}`,
-                  value,
-                }))}
-                onChange={(value: number) => {
-                  const normalizedBrightness = clamp(value, 0, 100);
-                  if (normalizedBrightness === brightnessValue) {
-                    return;
-                  }
-                  setBrightnessValue(normalizedBrightness);
-                  void handleRgbBrightness(normalizedBrightness);
-                }}
-              />
-            </PanelSectionRow>
-
-            {canAdjustSpeed && (
-              <PanelSectionRow>
-                <div style={cardStyle}>
-                  <div style={viewTitleStyle}>Animation Speed</div>
-                  <div style={subtextStyle}>
-                    Native animation speed for the current RGB mode.
-                  </div>
-                  <div style={optionGridStyle}>
-                    {(rgb.speed_options?.length ? rgb.speed_options : ["low", "medium", "high"]).map(
-                      (speed) => {
-                        const active = selectedSpeed === speed;
-                        return (
-                          <NativeOptionButton
-                            key={speed}
-                            title={RGB_SPEED_LABELS[speed] || speed}
-                            description={
-                              RGB_SPEED_DESCRIPTIONS[speed] ||
-                              "Native animation speed"
-                            }
-                            status={active ? "Selected" : "Available"}
-                            active={active}
-                            disabled={controlsDisabled}
-                            onClick={() => {
-                              if (speed === selectedSpeed) {
-                                return;
-                              }
-                              setSelectedSpeed(speed);
-                              void handleRgbSpeed(speed);
-                            }}
-                          />
-                        );
-                      }
-                    )}
-                  </div>
-                </div>
-              </PanelSectionRow>
-            )}
-
-            <PanelSectionRow>
-              <div style={cardStyle}>
-                <div style={viewTitleStyle}>Palette</div>
-                <div style={subtextStyle}>
-                  Quick colors for the common looks, with free hue selection above for everything
-                  else.
-                </div>
-                <div style={rgbPresetRailStyle(rgbPresets)} />
-                <div style={rgbQuickSwatchGridStyle}>
-                  {rgbPresets.map((color) => {
-                    const active = activeColor === color;
-                    return (
                       <button
                         key={color}
                         type="button"
                         disabled={!canAdjustColor || controlsDisabled}
                         style={{
-                          ...rgbQuickSwatchButtonStyle(active, color),
+                          ...rgbQuickSwatchButtonStyle(
+                            normalizeHexColor(color) === normalizedColor,
+                            color
+                          ),
                           opacity: !canAdjustColor || controlsDisabled ? 0.45 : 1,
                         }}
-                        onClick={() => {
-                          setSelectedColor(color);
-                          setHueValue(hexToHue(color));
-                          void handleRgbColor(color);
-                        }}
+                        onClick={() => void handlePresetColor(color)}
                       >
                         <div
                           style={{
@@ -1671,7 +1523,7 @@ const RGBView: VFC<{
                             padding: "7px 6px 8px",
                             fontSize: "10px",
                             fontWeight: 700,
-                            color: active ? "#ffffff" : "#cbd5e1",
+                            color: "#cbd5e1",
                             textAlign: "center",
                             lineHeight: 1.2,
                           }}
@@ -1679,11 +1531,69 @@ const RGBView: VFC<{
                           {RGB_PRESET_LABELS[color] || color.replace("#", "")}
                         </div>
                       </button>
-                    );
-                  })}
-                </div>
+                    ))}
+                  </div>
+                </PanelSectionRow>
+
+                <PanelSectionRow>
+                  <SliderField
+                    label="Brightness"
+                    value={clamp(rgb?.brightness ?? 100, 0, 100)}
+                    min={0}
+                    max={100}
+                    step={10}
+                    disabled={!canAdjustBrightness || controlsDisabled}
+                    onChange={handleBrightnessChange}
+                  />
+                </PanelSectionRow>
+
+                <PanelSectionRow>
+                  <DropdownItem
+                    label="Effect"
+                    strDefaultLabel={
+                      RGB_EFFECTS.find((effect) => effect.data === currentEffect)?.label ||
+                      "Static"
+                    }
+                    menuLabel={
+                      RGB_EFFECTS.find((effect) => effect.data === currentEffect)?.label ||
+                      "Static"
+                    }
+                    rgOptions={RGB_EFFECTS}
+                    selectedOption={
+                      RGB_EFFECTS.find((effect) => effect.data === currentEffect) ||
+                      RGB_EFFECTS[0]
+                    }
+                    onChange={handleEffectChange}
+                  />
+                </PanelSectionRow>
+
+                {RGB_ANIMATED_EFFECTS.includes(currentEffect) && (
+                  <PanelSectionRow>
+                    <SliderField
+                      label="Speed"
+                      value={rgbSpeedToSliderValue(rgb?.speed)}
+                      min={10}
+                      max={100}
+                      step={10}
+                      disabled={controlsDisabled}
+                      onChange={handleSpeedChange}
+                    />
+                  </PanelSectionRow>
+                )}
               </div>
-            </PanelSectionRow>
+            )}
+
+            {!rgb.enabled && (
+              <PanelSectionRow>
+                <div style={cardStyle}>
+                  <div style={viewTitleStyle}>RGB Lighting</div>
+                  <div style={subtextStyle}>
+                    Toggle RGB on to access the same direct color, brightness, effect, and speed
+                    workflow used by AllyCenter.
+                  </div>
+                </div>
+              </PanelSectionRow>
+            )}
           </PanelSection>
         </div>
       )}
@@ -1877,6 +1787,26 @@ const InformationView: VFC<{
                 <InfoRow
                   label="SteamOS bus"
                   value={data.runtime.steamos_manager_bus || "none"}
+                />
+                <InfoRow
+                  label="Backend user"
+                  value={data.runtime.privileges.user || "Unknown"}
+                />
+                <InfoRow
+                  label="EUID"
+                  value={`${data.runtime.privileges.effective_uid ?? "Unknown"}`}
+                />
+                <InfoRow
+                  label="Root"
+                  value={data.runtime.privileges.is_root ? "Yes" : "No"}
+                />
+                <InfoRow
+                  label="Passwordless sudo"
+                  value={data.runtime.privileges.sudo_noninteractive ? "Yes" : "No"}
+                />
+                <InfoRow
+                  label="System writes"
+                  value={data.runtime.privileges.system_write_access ? "Available" : "Blocked"}
                 />
                 <InfoRow
                   label="DISPLAY"

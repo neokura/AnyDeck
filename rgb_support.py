@@ -59,9 +59,9 @@ def get_rgb_supported_modes(backend: dict) -> list[str]:
         if protocol in {"legion_go_s", "legion_go_tablet"}:
             return ["solid", "pulse", "rainbow", "spiral"]
         return ["solid", "pulse", "rainbow"]
-    if backend["type"] == "asus_hid":
-        return ["solid", "pulse", "rainbow", "spiral"]
     if backend["type"] == "sysfs":
+        if "ASUS sysfs multicolor LED" in str(backend.get("details", "")):
+            return ["solid", "pulse", "rainbow", "spiral"]
         return ["solid"]
     return []
 
@@ -73,7 +73,10 @@ def get_rgb_mode_capabilities(backend: dict) -> dict[str, dict]:
         capabilities[mode] = {
             "color": mode in {"solid", "pulse"},
             "brightness": True,
-            "speed": backend["type"] in {"legion_hid", "asus_hid"} and mode in {"pulse", "rainbow", "spiral"},
+            "speed": mode in {"pulse", "rainbow", "spiral"} and (
+                backend["type"] == "legion_hid"
+                or "ASUS sysfs multicolor LED" in str(backend.get("details", ""))
+            ),
         }
     return capabilities
 
@@ -106,26 +109,6 @@ def hex_to_rgb(color: str) -> tuple[int, int, int]:
 
 def rgb_hid_padded(payload: list[int]) -> bytes:
     return bytes(payload) + bytes(max(0, 64 - len(payload)))
-
-
-def asus_rgb_brightness_level(brightness: int) -> int:
-    normalized = normalize_rgb_brightness(brightness)
-    if normalized <= 0:
-        return 0x00
-    if normalized <= 33:
-        return 0x01
-    if normalized <= 66:
-        return 0x02
-    return 0x03
-
-
-def asus_rgb_config_command(boot: bool = False, charging: bool = False) -> bytes:
-    value = 0x02
-    if boot:
-        value += 0x09
-    if charging:
-        value += 0x04
-    return rgb_hid_padded([0x5A, 0xD1, 0x09, 0x01, value])
 
 
 def legion_go_s_rgb_commands(
@@ -218,43 +201,6 @@ def legion_go_tablet_rgb_commands(
     commands.extend([enable_command(0x03, True), enable_command(0x04, True)])
     return commands
 
-
-def asus_hid_rgb_commands(
-    color: str,
-    enabled: bool,
-    brightness: int = RGB_DEFAULT_BRIGHTNESS,
-    mode: str = RGB_DEFAULT_MODE,
-    speed: str = RGB_DEFAULT_SPEED,
-) -> list[bytes]:
-    if not enabled:
-        return [rgb_hid_padded([0x5A, 0xBA, 0xC5, 0xC4, 0x00])]
-
-    r, g, b = hex_to_rgb(color)
-    mode_map = {
-        "solid": 0x00,
-        "pulse": 0x01,
-        "rainbow": 0x02,
-        "spiral": 0x03,
-    }
-    speed_map = {
-        "low": 0xE1,
-        "medium": 0xEB,
-        "high": 0xF5,
-    }
-    mode_value = mode_map.get(mode, 0x00)
-    speed_value = 0x00 if mode == "solid" else speed_map.get(speed, speed_map[RGB_DEFAULT_SPEED])
-    if mode == "spiral":
-        r, g, b = 0, 0, 0
-    payload = [0x5A, 0xB3, 0x00, mode_value, r, g, b, speed_value, 0x00, 0x00, 0x00, 0x00, 0x00]
-    return [
-        asus_rgb_config_command(),
-        rgb_hid_padded([0x5A, 0xBA, 0xC5, 0xC4, asus_rgb_brightness_level(brightness)]),
-        rgb_hid_padded(payload),
-        rgb_hid_padded([0x5A, 0xB5]),
-        rgb_hid_padded([0x5A, 0xB4]),
-    ]
-
-
 def legion_hid_rgb_commands(
     device: dict,
     color: str,
@@ -268,6 +214,4 @@ def legion_hid_rgb_commands(
         return legion_go_s_rgb_commands(color, enabled, brightness, mode, speed)
     if protocol == "legion_go_tablet":
         return legion_go_tablet_rgb_commands(color, enabled, brightness, mode, speed)
-    if protocol == "asus_ally":
-        return asus_hid_rgb_commands(color, enabled, brightness, mode, speed)
     return []

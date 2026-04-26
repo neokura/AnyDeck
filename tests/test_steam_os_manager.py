@@ -58,6 +58,74 @@ SUPPORTED_PLATFORM = {
 
 
 class SteamOsManagerClientTest(unittest.TestCase):
+    def test_main_bootstraps_plugin_directory_for_sibling_imports(self):
+        module_names = [
+            "state_aggregator",
+            "platform_support",
+            "rgb_support",
+            "optimization_support",
+            "optimization_ops",
+            "optimization_runtime",
+            "performance_service",
+            "display_service",
+            "rgb_controller",
+            "system_info",
+            "decky",
+        ]
+        previous_modules = {
+            name: sys.modules.get(name)
+            for name in module_names
+        }
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for name in module_names:
+                    sys.modules.pop(name, None)
+
+                for filename in [
+                    "main.py",
+                    "state_aggregator.py",
+                    "platform_support.py",
+                    "rgb_support.py",
+                    "optimization_support.py",
+                    "optimization_ops.py",
+                    "optimization_runtime.py",
+                    "performance_service.py",
+                    "display_service.py",
+                    "rgb_controller.py",
+                    "system_info.py",
+                ]:
+                    with open(filename, "r") as src, open(os.path.join(tmpdir, filename), "w") as dst:
+                        dst.write(src.read())
+
+                with open(os.path.join(tmpdir, "decky.py"), "w") as decky_file:
+                    decky_file.write(
+                        "class _Logger:\n"
+                        "    def info(self, *args, **kwargs):\n"
+                        "        pass\n"
+                        "    def warning(self, *args, **kwargs):\n"
+                        "        pass\n"
+                        "    def error(self, *args, **kwargs):\n"
+                        "        pass\n"
+                        "logger = _Logger()\n"
+                        "DECKY_PLUGIN_SETTINGS_DIR = '/tmp'\n"
+                    )
+
+                spec = importlib.util.spec_from_file_location(
+                    "plugin_main_bootstrap_test",
+                    os.path.join(tmpdir, "main.py"),
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                self.assertTrue(hasattr(module, "Plugin"))
+        finally:
+            for name in module_names:
+                sys.modules.pop(name, None)
+                previous = previous_modules.get(name)
+                if previous is not None:
+                    sys.modules[name] = previous
+
     def test_sanitized_system_env_removes_embedded_runtime_library_overrides(self):
         with patch.dict(
             "main.os.environ",
@@ -216,6 +284,33 @@ class SteamOsManagerClientTest(unittest.TestCase):
         self.assertTrue(state["available"])
         self.assertTrue(any("--system" in call for call in calls))
 
+    def test_introspect_parser_accepts_dotted_property_names(self):
+        output = "\n".join(
+            [
+                "com.steampowered.SteamOSManager1.PerformanceProfile1 interface - -",
+                ".AvailablePerformanceProfiles property as 3 emits-change",
+                ".PerformanceProfile property s - emits-change",
+                ".SuggestedDefaultPerformanceProfile property s - emits-change",
+            ]
+        )
+
+        with patch.object(
+            main.SteamOsManagerClient,
+            "_run_busctl",
+            return_value=subprocess.CompletedProcess(["busctl"], 0, output, ""),
+        ):
+            client = main.SteamOsManagerClient(FakeLogger())
+            properties = client._get_available_properties(main.STEAMOS_PERFORMANCE_INTERFACE)
+
+        self.assertEqual(
+            properties,
+            {
+                "AvailablePerformanceProfiles",
+                "PerformanceProfile",
+                "SuggestedDefaultPerformanceProfile",
+            },
+        )
+
     def test_sets_native_performance_profile(self):
         calls = []
 
@@ -300,6 +395,8 @@ class SteamOsManagerClientTest(unittest.TestCase):
         set_calls = [call for call in calls if "set-property" in call]
         self.assertEqual(set_calls[0][-1], "80")
         self.assertEqual(set_calls[1][-1], "-1")
+        self.assertNotIn("--", set_calls[0])
+        self.assertIn("--", set_calls[1])
 
     def test_reads_steamos_cpu_boost_state(self):
         def fake_run(cmd, **_kwargs):
@@ -427,6 +524,27 @@ class HostRuntimeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         run_mock.assert_called_once()
 
+    def test_run_forwards_environment_when_using_flatpak_spawn_host(self):
+        runtime = main.HostRuntime()
+
+        with patch.object(
+            runtime,
+            "resolve_command",
+            return_value={"available": True, "path": "/run/host/usr/bin/gamescopectl", "via_host": True},
+        ), patch("main.subprocess.run", return_value=subprocess.CompletedProcess(["flatpak-spawn"], 0, "", "")) as run_mock:
+            runtime.run(
+                ["gamescopectl", "get_fps_limit"],
+                env={
+                    "GAMESCOPE_WAYLAND_DISPLAY": "gamescope-0",
+                    "XDG_RUNTIME_DIR": "/run/user/1000",
+                },
+            )
+
+        command = run_mock.call_args.args[0]
+        self.assertIn("--env=GAMESCOPE_WAYLAND_DISPLAY=gamescope-0", command)
+        self.assertIn("--env=XDG_RUNTIME_DIR=/run/user/1000", command)
+        self.assertEqual(command[-2:], ["gamescopectl", "get_fps_limit"])
+
 
 class GamescopeSettingsClientTest(unittest.TestCase):
     def test_reads_gamescope_display_sync_state(self):
@@ -530,6 +648,25 @@ class GamescopeSettingsClientTest(unittest.TestCase):
         self.assertTrue(state["vrr"]["available"])
         self.assertTrue(state["vrr"]["enabled"])
         self.assertTrue(state["vrr"]["active"])
+
+    def test_vrr_is_unavailable_when_capable_atom_explicitly_reports_false(self):
+        outputs = {
+            main.GAMESCOPE_VRR_CAPABLE_ATOM: "GAMESCOPE_VRR_CAPABLE(CARDINAL) = 0\n",
+            main.GAMESCOPE_VRR_ENABLED_ATOM: "GAMESCOPE_VRR_ENABLED(CARDINAL) = 1\n",
+            main.GAMESCOPE_VRR_FEEDBACK_ATOM: "GAMESCOPE_VRR_FEEDBACK(CARDINAL) = 1\n",
+            main.GAMESCOPE_ALLOW_TEARING_ATOM: "GAMESCOPE_ALLOW_TEARING(CARDINAL) = 0\n",
+        }
+
+        def fake_run(cmd, **_kwargs):
+            return subprocess.CompletedProcess(cmd, 0, outputs[cmd[-1]], "")
+
+        with patch("main.subprocess.run", side_effect=fake_run):
+            client = main.GamescopeSettingsClient(FakeLogger(), display=":0")
+            state = client.get_display_sync_state()
+
+        self.assertFalse(state["vrr"]["available"])
+        self.assertFalse(state["vrr"]["capable"])
+        self.assertEqual(state["vrr"]["status"], "Display is not VRR capable")
 
 
 class PluginPerformanceProfileTest(unittest.TestCase):
@@ -947,6 +1084,19 @@ eDP-1 connected primary 1920x1080+0+0
 
         self.assertEqual(rates, [90, 120])
 
+    def test_run_command_output_accepts_use_sudo_kwarg(self):
+        plugin = main.Plugin()
+
+        with patch.object(
+            plugin.runtime,
+            "run",
+            return_value=subprocess.CompletedProcess(["gamescopectl"], 0, "ok\n", ""),
+        ):
+            success, output = plugin._run_command_output(["gamescopectl", "get_fps_limit"], use_sudo=False)
+
+        self.assertTrue(success)
+        self.assertEqual(output, "ok")
+
     def test_fps_limit_rejects_values_outside_supported_presets(self):
         plugin = main.Plugin()
         plugin.settings = {"fps_limit": 0}
@@ -1090,9 +1240,66 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertTrue(state["enabled"])
         self.assertEqual(state["limit"], 80)
 
+    def test_charge_limit_falls_back_to_asus_wmi_state(self):
+        plugin = main.Plugin()
+        plugin.steamos_manager = types.SimpleNamespace(
+            get_charge_limit_state=lambda: {
+                "available": False,
+                "enabled": False,
+                "limit": 100,
+                "status": "missing",
+                "details": "missing",
+            }
+        )
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin,
+            "_get_asus_charge_limit_state",
+            return_value={
+                "available": True,
+                "enabled": True,
+                "limit": 80,
+                "status": "available",
+                "details": "asus",
+            },
+        ):
+            state = asyncio.run(plugin.get_charge_limit_state())
+
+        self.assertTrue(state["available"])
+        self.assertTrue(state["enabled"])
+        self.assertEqual(state["limit"], 80)
+
+    def test_set_charge_limit_falls_back_to_asus_wmi(self):
+        plugin = main.Plugin()
+        plugin.steamos_manager = types.SimpleNamespace(
+            set_charge_limit_enabled=lambda _enabled: (False, "dbus unavailable")
+        )
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin,
+            "_get_asus_charge_limit_state",
+            return_value={"available": True, "enabled": False, "limit": 100},
+        ), patch.object(
+            plugin,
+            "_set_asus_charge_limit_enabled",
+            return_value=(True, ""),
+        ) as set_asus_charge_limit:
+            success = asyncio.run(plugin.set_charge_limit_enabled(True))
+
+        self.assertTrue(success)
+        set_asus_charge_limit.assert_called_once_with(True)
+
     def test_cpu_settings_report_boost_disabled_when_control_is_unavailable(self):
         plugin = main.Plugin()
         original_exists = os.path.exists
+        plugin.steamos_manager = types.SimpleNamespace(
+            get_cpu_boost_state=lambda: {
+                "available": False,
+                "enabled": False,
+                "status": "missing",
+                "details": "missing",
+            }
+        )
 
         with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
             plugin,
@@ -1460,80 +1667,153 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertEqual(FakeHidDevice.writes[0], bytes([0x05, 0x06, 0x70, 0x02, 0x03, 0x00, 0x01]))
         self.assertEqual(FakeHidDevice.writes[1], bytes([0x05, 0x06, 0x70, 0x02, 0x04, 0x00, 0x01]))
 
-    def test_asus_ally_hid_rgb_supports_native_modes(self):
+    def test_asus_prefers_sysfs_rgb_backend_when_wmi_led_is_available(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "_get_rgb_led_path", return_value=main.ALLY_LED_PATH), patch.object(
+            plugin,
+            "_has_asus_wmi",
+            return_value=True,
+        ):
+            backend = plugin._get_rgb_backend()
+
+        self.assertEqual(backend["type"], "sysfs")
+        self.assertEqual(backend["path"], main.ALLY_LED_PATH)
+
+    def test_asus_without_ally_led_does_not_claim_asus_hid_backend(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "_get_rgb_led_path", return_value=""), patch.object(
+            plugin,
+            "_has_asus_wmi",
+            return_value=True,
+        ):
+            backend = plugin._get_rgb_backend()
+
+        self.assertEqual(backend["type"], "none")
+        self.assertEqual(backend["details"], "RGB control unavailable")
+
+    def test_set_rgb_effect_maps_spectrum_to_rainbow_and_enables_rgb(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "set_rgb_mode", return_value=True) as set_mode, patch.object(
+            plugin,
+            "set_rgb_enabled",
+            return_value=True,
+        ) as set_enabled:
+            success = asyncio.run(plugin.set_rgb_effect("spectrum"))
+
+        self.assertTrue(success)
+        set_mode.assert_called_once_with("rainbow")
+        set_enabled.assert_called_once_with(True)
+
+    def test_set_rgb_effect_turns_rgb_off(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "set_rgb_enabled", return_value=True) as set_enabled:
+            success = asyncio.run(plugin.set_rgb_effect("off"))
+
+        self.assertTrue(success)
+        set_enabled.assert_called_once_with(False)
+
+    def test_legion_hid_rgb_falls_back_to_raw_hidraw_write_when_hid_open_fails(self):
         plugin = main.Plugin()
         plugin.settings_path = None
         plugin.settings = {
             "rgb_enabled": True,
             "rgb_color": "#00FFFF",
-            "rgb_brightness": 75,
             "rgb_mode": "solid",
             "rgb_speed": "medium",
         }
-        FakeHidDevice.writes = []
-        FakeHidModule.devices = [
-            {
-                "path": b"/dev/hidraw-ally",
-                "vendor_id": 0x0B05,
-                "product_id": 0x1ABE,
-                "usage_page": 0xFF31,
-                "usage": 0x0080,
-                "interface_number": 0,
-            }
-        ]
+
+        class FailingHidModule:
+            devices = [
+                {
+                    "path": b"/dev/hidraw-fallback",
+                    "vendor_id": 0x1A86,
+                    "product_id": 0xE310,
+                    "usage_page": 0xFFA0,
+                    "usage": 0x0001,
+                    "interface_number": 3,
+                }
+            ]
+
+            @classmethod
+            def enumerate(cls):
+                return cls.devices
+
+            class Device:
+                def __init__(self, path=None):
+                    raise OSError("unable to open device")
+
+        writes = []
+
+        class RawWriter:
+            def __init__(self, path, mode="rb", buffering=-1):
+                self.path = path
+                self.mode = mode
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def write(self, data):
+                writes.append(bytes(data))
 
         with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
             plugin, "_get_rgb_led_path", return_value=""
         ), patch.object(
-            plugin, "_hid_module", return_value=FakeHidModule
+            plugin, "_hid_module", return_value=FailingHidModule
         ), patch.object(
             plugin, "_hidraw_devices", return_value=[]
-        ):
+        ), patch("main.os.path.exists", side_effect=lambda path: path == "/dev/hidraw-fallback"), patch(
+            "main.os.access", side_effect=lambda path, mode: path == "/dev/hidraw-fallback"
+        ), patch("main.open", side_effect=lambda path, mode="r", *args, **kwargs: RawWriter(path, mode)):
             state = asyncio.run(plugin.get_rgb_state())
-            success = asyncio.run(plugin.set_rgb_mode("spiral"))
+            success = asyncio.run(plugin.set_rgb_enabled(False))
 
         self.assertTrue(state["available"])
-        self.assertIn("ASUS Handheld", state["details"])
-        self.assertEqual(state["supported_modes"], ["solid", "pulse", "rainbow", "spiral"])
         self.assertTrue(success)
-        self.assertEqual(FakeHidDevice.writes[0][:5], bytes([0x5A, 0xD1, 0x09, 0x01, 0x02]))
-        self.assertEqual(FakeHidDevice.writes[1][:5], bytes([0x5A, 0xBA, 0xC5, 0xC4, 0x03]))
-        self.assertEqual(FakeHidDevice.writes[2][:8], bytes([0x5A, 0xB3, 0x00, 0x03, 0x00, 0x00, 0x00, 0xEB]))
+        self.assertGreaterEqual(len(writes), 1)
 
-    def test_asus_hid_backend_accepts_new_asus_handheld_pids_with_same_usage_signature(self):
+    def test_rgb_hid_backend_is_hidden_when_device_is_not_accessible(self):
         plugin = main.Plugin()
         plugin.settings_path = None
-        plugin.settings = {
-            "rgb_enabled": True,
-            "rgb_color": "#FF00FF",
-            "rgb_brightness": 100,
-            "rgb_mode": "rainbow",
-            "rgb_speed": "medium",
-        }
-        FakeHidDevice.writes = []
-        FakeHidModule.devices = [
-            {
-                "path": b"/dev/hidraw-future-asus",
-                "vendor_id": 0x0B05,
-                "product_id": 0xFFFF,
-                "usage_page": 0xFF31,
-                "usage": 0x0080,
-                "interface_number": 0,
-            }
-        ]
+        plugin.settings = {"rgb_enabled": True, "rgb_color": "#00FFFF"}
+
+        class InaccessibleHidModule:
+            devices = [
+                {
+                    "path": b"/dev/hidraw-inaccessible",
+                    "vendor_id": 0x1A86,
+                    "product_id": 0xE310,
+                    "usage_page": 0xFFA0,
+                    "usage": 0x0001,
+                    "interface_number": 3,
+                }
+            ]
+
+            @classmethod
+            def enumerate(cls):
+                return cls.devices
+
+            class Device:
+                def __init__(self, path=None):
+                    raise OSError("unable to open device")
 
         with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
             plugin, "_get_rgb_led_path", return_value=""
         ), patch.object(
-            plugin, "_hid_module", return_value=FakeHidModule
+            plugin, "_hid_module", return_value=InaccessibleHidModule
         ), patch.object(
             plugin, "_hidraw_devices", return_value=[]
-        ):
+        ), patch("main.os.path.exists", return_value=False), patch("main.os.access", return_value=False):
             state = asyncio.run(plugin.get_rgb_state())
 
-        self.assertTrue(state["available"])
-        self.assertIn("ASUS Handheld", state["details"])
-        self.assertEqual(state["supported_modes"], ["solid", "pulse", "rainbow", "spiral"])
+        self.assertFalse(state["available"])
+        self.assertIn("not writable", state["details"])
 
     def test_rgb_state_is_exposed_in_dashboard(self):
         plugin = main.Plugin()
@@ -1764,6 +2044,13 @@ eDP-1 connected primary 1920x1080+0+0
                 "execution_backend": "flatpak-host",
                 "os_release_path": "/run/host/etc/os-release",
                 "host_os_id": "steamos",
+                "privileges": {
+                    "user": "root",
+                    "effective_uid": 0,
+                    "is_root": True,
+                    "sudo_noninteractive": True,
+                    "system_write_access": True,
+                },
                 "commands": {
                     "busctl": {"available": True, "path": "/run/host/usr/bin/busctl", "via_host": True},
                     "gamescopectl": {"available": True, "path": "/run/host/usr/bin/gamescopectl", "via_host": True},
@@ -1778,12 +2065,23 @@ eDP-1 connected primary 1920x1080+0+0
                     "gamescope_wayland_display": "gamescope-0",
                 },
             },
+        ), patch.object(
+            plugin,
+            "_get_privilege_state",
+            return_value={
+                "user": "root",
+                "effective_uid": 0,
+                "is_root": True,
+                "sudo_noninteractive": True,
+                "system_write_access": True,
+            },
         ):
             state = asyncio.run(plugin.get_information_state())
 
         self.assertEqual(state["runtime"]["execution_backend"], "flatpak-host")
         self.assertEqual(state["runtime"]["os_release_path"], "/run/host/etc/os-release")
         self.assertEqual(state["runtime"]["steamos_manager_bus"], "user")
+        self.assertTrue(state["runtime"]["privileges"]["system_write_access"])
         self.assertEqual(state["runtime"]["display_env"]["gamescope_wayland_display"], "gamescope-0")
         self.assertTrue(state["runtime"]["commands"]["busctl"]["via_host"])
 
@@ -2257,6 +2555,28 @@ class OptimizationStateTest(unittest.TestCase):
         self.assertIn("usb_wake", keys)
         self.assertIn("kernel_amd_pstate", keys)
         self.assertIn("kernel_abm_off", keys)
+
+    def test_optimization_states_report_mutability_when_root_access_is_missing(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin, "_command_exists", return_value=True
+        ), patch.object(
+            plugin, "_is_amd_platform", return_value=True
+        ), patch.object(
+            plugin, "_amd_npu_present", return_value=True
+        ), patch.object(
+            plugin, "_usb_wake_control_available", return_value=True
+        ), patch.object(
+            plugin, "_system_write_access_available", return_value=False
+        ), patch("main.os.path.exists", return_value=True):
+            state = asyncio.run(plugin.get_optimization_states())
+
+        self.assertTrue(any(item["available"] for item in state["states"]))
+        self.assertTrue(all(item.get("mutable") is False for item in state["states"]))
+        self.assertTrue(
+            all("not running with enough host privileges" in item.get("details", "") for item in state["states"])
+        )
 
     def test_enable_available_optimizations_skips_unavailable_controls(self):
         plugin = main.Plugin()

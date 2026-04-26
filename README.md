@@ -8,7 +8,7 @@ AnyDeck is a root Decky Loader plugin for AMD x86 handhelds running SteamOS.
 
 The goal is simple: make a non-Steam-Deck handheld feel closer to a Steam Deck without faking support, shipping mystery presets, or silently writing system state behind the user’s back.
 
-Current release line: `0.2.0-alpha.8`
+Current release line: `0.2.0-alpha.9`
 
 ## What It Is
 
@@ -187,7 +187,10 @@ That means:
 - Decky should launch the backend as root
 - protected writes can then happen directly when the user explicitly requests them
 
-The installer does not create extra `sudoers` or `polkit` rules. If the backend is not actually running as root, some protected operations may fall back to `sudo -n`, but that is not the preferred deployment path.
+The installer now verifies Decky's `plugin_loader` service and installs a root
+systemd override when needed so the backend keeps the privileges required for
+protected writes in Game Mode. It still does not create broad `sudoers` or
+`polkit` rules.
 
 ## Installation
 
@@ -213,7 +216,7 @@ $HOME/homebrew/plugins/AnyDeck
 ### Install a specific version
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/neokura/AnyDeck/main/install.sh) 0.2.0-alpha.8
+bash <(curl -fsSL https://raw.githubusercontent.com/neokura/AnyDeck/main/install.sh) 0.2.0-alpha.9
 ```
 
 ## First Launch Behavior
