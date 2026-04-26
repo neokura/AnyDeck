@@ -455,6 +455,13 @@ const infoValueStyle: React.CSSProperties = {
   lineHeight: 1.4,
 };
 
+const inlineMessageStyle = (tone: "neutral" | "error" = "neutral"): React.CSSProperties => ({
+  fontSize: "12px",
+  lineHeight: 1.4,
+  color: tone === "error" ? "#fca5a5" : "#8b929a",
+  width: "100%",
+});
+
 const rgbQuickSwatchGridStyle: React.CSSProperties = {
   display: "grid",
   gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
@@ -516,13 +523,6 @@ const nativeButtonTitleStyle = (active: boolean): React.CSSProperties => ({
   fontWeight: 700,
   fontSize: "11px",
   lineHeight: 1.2,
-  overflowWrap: "anywhere",
-});
-
-const nativeButtonDescriptionStyle = (active: boolean): React.CSSProperties => ({
-  color: active ? "#bfdbfe" : "#9aa6b2",
-  fontSize: "9px",
-  lineHeight: 1.25,
   overflowWrap: "anywhere",
 });
 
@@ -658,29 +658,6 @@ const formatToggleLabel = (
 const formatFpsLabel = (value: number): string =>
   value === 0 ? "Unlimited" : `${value} FPS`;
 
-const formatFpsReadout = (state: FpsLimitState): string => {
-  if (!state.available) {
-    return state.status;
-  }
-  if (state.is_live) {
-    return `Current limit: ${formatFpsLabel(state.current)}`;
-  }
-  return state.details;
-};
-
-const compactPerformanceDescription = (modeId: string): string => {
-  switch (modeId) {
-    case "low-power":
-      return "Cool and quiet";
-    case "balanced":
-      return "Everyday play";
-    case "performance":
-      return "Higher performance";
-    default:
-      return "Performance mode";
-  }
-};
-
 const PerformanceModeGlyph: VFC<{ modeId: string; active: boolean }> = ({
   modeId,
   active,
@@ -725,7 +702,6 @@ const PerformanceModeGlyph: VFC<{ modeId: string; active: boolean }> = ({
 
 interface NativeOptionButtonProps {
   title: string;
-  description?: string;
   status?: string;
   active?: boolean;
   disabled?: boolean;
@@ -735,7 +711,6 @@ interface NativeOptionButtonProps {
 
 const NativeOptionButton: VFC<NativeOptionButtonProps> = ({
   title,
-  description,
   status,
   active = false,
   disabled = false,
@@ -752,9 +727,6 @@ const NativeOptionButton: VFC<NativeOptionButtonProps> = ({
         {icon}
         <div style={nativeButtonTextBlockStyle}>
           <div style={nativeButtonTitleStyle(active)}>{title}</div>
-          {description && (
-            <div style={nativeButtonDescriptionStyle(active)}>{description}</div>
-          )}
         </div>
         {status && <div style={nativeButtonBadgeStyle(active, disabled)}>{status}</div>}
       </div>
@@ -834,7 +806,7 @@ const InfoRow: VFC<{ label: string; value: string }> = ({ label, value }) => (
 
 const ViewHeader: VFC<{
   title: string;
-  subtitle: string;
+  subtitle?: string;
   backLabel?: string;
   onBack?: () => void;
 }> = ({ title, subtitle, backLabel, onBack }) => (
@@ -847,40 +819,12 @@ const ViewHeader: VFC<{
       </PanelSectionRow>
     )}
     <PanelSectionRow>
-      <div style={cardStyle}>
+      <div style={{ width: "100%" }}>
         <div style={viewTitleStyle}>{title}</div>
-        <div style={subtextStyle}>{subtitle}</div>
+        {subtitle ? <div style={subtextStyle}>{subtitle}</div> : null}
       </div>
     </PanelSectionRow>
   </PanelSection>
-);
-
-const StatusCard: VFC<{
-  title: string;
-  message: string;
-  tone?: "neutral" | "error";
-}> = ({ title, message, tone = "neutral" }) => (
-  <div
-    style={{
-      ...cardStyle,
-      border:
-        tone === "error"
-          ? "1px solid rgba(248, 113, 113, 0.4)"
-          : "1px solid rgba(100, 116, 139, 0.35)",
-      marginBottom: 0,
-    }}
-  >
-    <div
-      style={{
-        ...viewTitleStyle,
-        fontSize: "15px",
-        color: tone === "error" ? "#fecaca" : "#ffffff",
-      }}
-    >
-      {title}
-    </div>
-    <div style={subtextStyle}>{message}</div>
-  </div>
 );
 
 const DashboardView: VFC<{
@@ -1002,13 +946,13 @@ const DashboardView: VFC<{
     return (
       <PanelSection title="Dashboard">
         <PanelSectionRow>
-          <div style={{ ...cardStyle, ...subtextStyle }}>
+          <div style={inlineMessageStyle()}>
             {loading ? "Loading dashboard..." : "Dashboard data is unavailable right now."}
           </div>
         </PanelSectionRow>
         {error && (
           <PanelSectionRow>
-            <StatusCard title="Refresh Failed" message={error} tone="error" />
+            <div style={inlineMessageStyle("error")}>{error}</div>
           </PanelSectionRow>
         )}
         {!loading && (
@@ -1026,25 +970,7 @@ const DashboardView: VFC<{
     <PanelSection title="Dashboard">
       {error && (
         <PanelSectionRow>
-          <StatusCard
-            title="Last Refresh Failed"
-            message={error}
-            tone="error"
-          />
-        </PanelSectionRow>
-      )}
-      <PanelSectionRow>
-        <div style={cardStyle}>
-          <div style={viewTitleStyle}>Performance Modes</div>
-          <div style={subtextStyle}>
-            Choose the handheld's overall behavior directly.
-          </div>
-        </div>
-      </PanelSectionRow>
-
-      {!data.profiles_available && (
-        <PanelSectionRow>
-          <div style={{ ...cardStyle, ...subtextStyle }}>{data.profiles_status}</div>
+          <div style={inlineMessageStyle("error")}>{error}</div>
         </PanelSectionRow>
       )}
 
@@ -1054,7 +980,6 @@ const DashboardView: VFC<{
             <NativeOptionButton
               key={mode.id}
               title={mode.label}
-              description={compactPerformanceDescription(mode.id)}
               status={mode.active ? "Active" : mode.available ? "Ready" : "Unavailable"}
               active={mode.active}
               disabled={!mode.available || controlsDisabled}
@@ -1068,7 +993,6 @@ const DashboardView: VFC<{
       <PanelSectionRow>
         <ToggleField
           label={formatToggleLabel("CPU Boost", data.cpu_boost)}
-          description={data.cpu_boost.details}
           checked={data.cpu_boost.enabled}
           disabled={!data.cpu_boost.available || controlsDisabled}
           onChange={handleBoost}
@@ -1078,7 +1002,6 @@ const DashboardView: VFC<{
       <PanelSectionRow>
         <ToggleField
           label={formatToggleLabel("SMT", data.smt)}
-          description={data.smt.details}
           checked={data.smt.enabled}
           disabled={!data.smt.available || controlsDisabled}
           onChange={handleSmt}
@@ -1090,7 +1013,6 @@ const DashboardView: VFC<{
           label={`Charge limit: ${
             data.charge_limit.enabled ? `${data.charge_limit.limit}%` : "disabled"
           }`}
-          description={data.charge_limit.details}
           checked={data.charge_limit.enabled}
           disabled={!data.charge_limit.available || controlsDisabled}
           onChange={handleChargeLimit}
@@ -1100,13 +1022,6 @@ const DashboardView: VFC<{
       <PanelSectionRow>
         <ToggleField
           label={`VRR: ${formatDisplayStatus(data.vrr).toLowerCase()}`}
-          description={
-            data.vrr.available
-              ? data.vrr.active
-                ? "VRR currently active"
-                : data.vrr.details || data.vrr.status
-              : data.vrr.status || data.vrr.details
-          }
           checked={data.vrr.enabled}
           disabled={!data.vrr.available || controlsDisabled}
           onChange={(enabled: boolean) => handleSync("vrr", enabled)}
@@ -1116,11 +1031,6 @@ const DashboardView: VFC<{
       <PanelSectionRow>
         <ToggleField
           label={`V-Sync: ${formatDisplayStatus(data.vsync).toLowerCase()}`}
-          description={
-            data.vsync.available
-              ? data.vsync.details || data.vsync.status
-              : data.vsync.status || data.vsync.details
-          }
           checked={data.vsync.enabled}
           disabled={!data.vsync.available || controlsDisabled}
           onChange={(enabled: boolean) => handleSync("vsync", enabled)}
@@ -1130,7 +1040,6 @@ const DashboardView: VFC<{
       <PanelSectionRow>
         <SliderField
           label={`Max Framerate: ${formatFpsLabel(fpsPresetValue)}`}
-          description={formatFpsReadout(data.fps_limit)}
           value={fpsPresetIndex}
           min={0}
           max={Math.max(0, fpsPresets.length - 1)}
@@ -1248,19 +1157,18 @@ const OptimizationsView: VFC<{
     <div>
       <ViewHeader
         title="Optimizations"
-        subtitle="Optional optimizations that can be disabled, sometimes requiring a reboot."
         onBack={onBack}
       />
       {!data ? (
         <PanelSection>
           <PanelSectionRow>
-            <div style={{ ...cardStyle, ...subtextStyle }}>
+            <div style={inlineMessageStyle()}>
               {loading ? "Loading optimizations..." : "Optimization data is unavailable right now."}
             </div>
           </PanelSectionRow>
           {error && (
             <PanelSectionRow>
-              <StatusCard title="Refresh Failed" message={error} tone="error" />
+              <div style={inlineMessageStyle("error")}>{error}</div>
             </PanelSectionRow>
           )}
           {!loading && (
@@ -1275,7 +1183,7 @@ const OptimizationsView: VFC<{
         <PanelSection title="Optimizations">
           {error && (
             <PanelSectionRow>
-              <StatusCard title="Last Refresh Failed" message={error} tone="error" />
+              <div style={inlineMessageStyle("error")}>{error}</div>
             </PanelSectionRow>
           )}
           <PanelSectionRow>
@@ -1434,19 +1342,18 @@ const RGBView: VFC<{
     <div>
       <ViewHeader
         title="RGB"
-        subtitle="Dedicated lighting controls with a cleaner preset workflow."
         onBack={onBack}
       />
       {!data || !rgb ? (
         <PanelSection>
           <PanelSectionRow>
-            <div style={{ ...cardStyle, ...subtextStyle }}>
+            <div style={inlineMessageStyle()}>
               {loading ? "Loading RGB controls..." : "RGB controls are unavailable right now."}
             </div>
           </PanelSectionRow>
           {error && (
             <PanelSectionRow>
-              <StatusCard title="Refresh Failed" message={error} tone="error" />
+              <div style={inlineMessageStyle("error")}>{error}</div>
             </PanelSectionRow>
           )}
           {!loading && (
@@ -1460,18 +1367,15 @@ const RGBView: VFC<{
       ) : (
         <div>
           {error && (
-            <PanelSection>
-              <PanelSectionRow>
-                <StatusCard title="Last Refresh Failed" message={error} tone="error" />
-              </PanelSectionRow>
-            </PanelSection>
+            <PanelSectionRow>
+              <div style={inlineMessageStyle("error")}>{error}</div>
+            </PanelSectionRow>
           )}
 
           <PanelSection title="RGB Lighting">
             <PanelSectionRow>
               <ToggleField
                 label="Enable RGB"
-                description={rgb.details}
                 checked={rgb.enabled}
                 disabled={!canToggleRgb || controlsDisabled}
                 onChange={handleToggle}
@@ -1582,18 +1486,6 @@ const RGBView: VFC<{
                 )}
               </div>
             )}
-
-            {!rgb.enabled && (
-              <PanelSectionRow>
-                <div style={cardStyle}>
-                  <div style={viewTitleStyle}>RGB Lighting</div>
-                  <div style={subtextStyle}>
-                    Toggle RGB on to access the same direct color, brightness, effect, and speed
-                    workflow used by AllyCenter.
-                  </div>
-                </div>
-              </PanelSectionRow>
-            )}
           </PanelSection>
         </div>
       )}
@@ -1615,19 +1507,18 @@ const InformationView: VFC<{
     <div>
       <ViewHeader
         title="Information"
-        subtitle="Detailed technical status for the handheld and available controls."
         onBack={onBack}
       />
       {!data ? (
         <PanelSection>
           <PanelSectionRow>
-            <div style={{ ...cardStyle, ...subtextStyle }}>
+            <div style={inlineMessageStyle()}>
               {loading ? "Loading information..." : "Information data is unavailable right now."}
             </div>
           </PanelSectionRow>
           {error && (
             <PanelSectionRow>
-              <StatusCard title="Refresh Failed" message={error} tone="error" />
+              <div style={inlineMessageStyle("error")}>{error}</div>
             </PanelSectionRow>
           )}
           {!loading && (
@@ -1641,11 +1532,9 @@ const InformationView: VFC<{
       ) : (
         <div>
           {error && (
-            <PanelSection title="Status">
-              <PanelSectionRow>
-                <StatusCard title="Last Refresh Failed" message={error} tone="error" />
-              </PanelSectionRow>
-            </PanelSection>
+            <PanelSectionRow>
+              <div style={inlineMessageStyle("error")}>{error}</div>
+            </PanelSectionRow>
           )}
           <PanelSection title="Device">
             <PanelSectionRow>

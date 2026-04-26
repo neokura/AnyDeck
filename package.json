@@ -1,6 +1,6 @@
 {
   "name": "anydeck",
-  "version": "0.2.0-alpha.10",
+  "version": "0.2.0-alpha.11",
   "description": "Alpha Decky Loader plugin for turning AMD x86 handhelds on SteamOS into a Steam Deck-like experience",
   "author": "Neokura",
   "license": "MIT",

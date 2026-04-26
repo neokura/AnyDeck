@@ -9,10 +9,6 @@ PLUGIN_DIR="$HOME/homebrew/plugins/$PLUGIN_NAME"
 REPO_OWNER="neokura"
 REPO_NAME="AnyDeck"
 REQUESTED_VERSION="${1:-${ANYDECK_VERSION:-}}"
-PLUGIN_LOADER_SERVICE_NAME="plugin_loader"
-PLUGIN_LOADER_OVERRIDE_DIR="/etc/systemd/system/${PLUGIN_LOADER_SERVICE_NAME}.service.d"
-PLUGIN_LOADER_OVERRIDE_FILE="${PLUGIN_LOADER_OVERRIDE_DIR}/90-anydeck-root.conf"
-
 TEMP_FILES=()
 cleanup() {
     if [ ${#TEMP_FILES[@]} -gt 0 ]; then
@@ -24,7 +20,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-PLUGIN_LOADER_UNIT="$HOME/homebrew/services/.systemd/plugin_loader.service"
+PLUGIN_LOADER_SYSTEMD_DIR="$HOME/homebrew/services/.systemd"
+PLUGIN_LOADER_UNIT="$PLUGIN_LOADER_SYSTEMD_DIR/plugin_loader.service"
+PLUGIN_LOADER_SERVICE_NAMES=()
+
+discover_plugin_loader_services() {
+    local unit_path
+    local service_name
+
+    PLUGIN_LOADER_SERVICE_NAMES=()
+
+    if [ -d "$PLUGIN_LOADER_SYSTEMD_DIR" ]; then
+        while IFS= read -r unit_path; do
+            [ -n "$unit_path" ] || continue
+            service_name="$(basename "$unit_path" .service)"
+            PLUGIN_LOADER_SERVICE_NAMES+=("$service_name")
+        done < <(find "$PLUGIN_LOADER_SYSTEMD_DIR" -maxdepth 1 -type f -name 'plugin_loader*.service' | sort)
+    fi
+
+    if [ ${#PLUGIN_LOADER_SERVICE_NAMES[@]} -eq 0 ]; then
+        PLUGIN_LOADER_SERVICE_NAMES=("plugin_loader")
+    fi
+}
 
 require_command() {
     local cmd="$1"
@@ -74,64 +91,93 @@ validate_plugin_layout() {
 }
 
 check_plugin_loader_root_mode() {
-    if [ ! -f "$PLUGIN_LOADER_UNIT" ]; then
-        echo "⚠ Could not inspect Decky service unit: $PLUGIN_LOADER_UNIT"
+    local service_name
+    local unit_path
+    local missing=0
+
+    for service_name in "${PLUGIN_LOADER_SERVICE_NAMES[@]}"; do
+        unit_path="$PLUGIN_LOADER_SYSTEMD_DIR/${service_name}.service"
+        if [ ! -f "$unit_path" ]; then
+            echo "⚠ Could not inspect Decky service unit: $unit_path"
+            missing=1
+            continue
+        fi
+
+        if grep -Eq '^[[:space:]]*User=root[[:space:]]*$' "$unit_path"; then
+            echo "✓ Decky ${service_name} unit is configured with User=root"
+            continue
+        fi
+
+        echo "⚠ Decky ${service_name} does not appear to run as User=root."
+        echo "  Protected writes may fail unless your setup provides passwordless sudo."
+        echo "  Check: $unit_path"
+    done
+
+    if [ "$missing" -eq 1 ]; then
         echo "  AnyDeck expects Decky to launch plugin backends with effective root access."
-        return 0
     fi
 
-    if grep -Eq '^[[:space:]]*User=root[[:space:]]*$' "$PLUGIN_LOADER_UNIT"; then
-        echo "✓ Decky plugin_loader is configured with User=root"
-        return 0
-    fi
-
-    echo "⚠ Decky plugin_loader does not appear to run as User=root."
-    echo "  Protected writes may fail unless your setup provides passwordless sudo."
-    echo "  Check: $PLUGIN_LOADER_UNIT"
     return 0
 }
 
 ensure_plugin_loader_root_mode() {
-    if grep -Eq '^[[:space:]]*User=root[[:space:]]*$' "$PLUGIN_LOADER_UNIT" 2>/dev/null; then
-        echo "✓ Decky plugin_loader is already configured with User=root"
-        return 0
-    fi
+    local service_name
+    local override_dir
+    local override_file
+    local applied=0
 
-    echo "Configuring Decky plugin_loader override for root backend access..."
-    sudo mkdir -p "$PLUGIN_LOADER_OVERRIDE_DIR"
-    sudo tee "$PLUGIN_LOADER_OVERRIDE_FILE" >/dev/null <<'EOF'
+    for service_name in "${PLUGIN_LOADER_SERVICE_NAMES[@]}"; do
+        override_dir="/etc/systemd/system/${service_name}.service.d"
+        override_file="${override_dir}/90-anydeck-root.conf"
+
+        echo "Configuring Decky ${service_name} override for root backend access..."
+        sudo mkdir -p "$override_dir"
+        sudo tee "$override_file" >/dev/null <<'EOF'
 [Service]
 User=root
 EOF
+        echo "✓ Installed systemd override: $override_file"
+        applied=1
+    done
 
-    if command -v systemctl >/dev/null 2>&1; then
-        sudo systemctl daemon-reload
-        echo "✓ Installed systemd override: $PLUGIN_LOADER_OVERRIDE_FILE"
-    else
-        echo "⚠ systemctl is unavailable; created the override but could not reload systemd"
+    if [ "$applied" -eq 0 ]; then
+        echo "Error: No Decky plugin_loader services were detected."
+        exit 1
     fi
+
+    sudo systemctl daemon-reload
 }
 
 verify_plugin_loader_effective_user() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        echo "⚠ systemctl is unavailable; unable to verify plugin_loader effective user"
-        return 0
-    fi
-
+    local service_name
     local effective_user
-    effective_user="$(systemctl show "$PLUGIN_LOADER_SERVICE_NAME" -p User --value 2>/dev/null || true)"
-    if [ "$effective_user" = "root" ]; then
-        echo "✓ plugin_loader effective user is root"
-        return 0
-    fi
+    local failed=0
 
-    if [ -n "$effective_user" ]; then
-        echo "⚠ plugin_loader effective user is '$effective_user' instead of 'root'"
-    else
-        echo "⚠ Could not read plugin_loader effective user from systemd"
-    fi
-    echo "  AnyDeck may not be able to apply protected settings until Decky is relaunched in root mode."
-    return 0
+    for service_name in "${PLUGIN_LOADER_SERVICE_NAMES[@]}"; do
+        effective_user="$(systemctl show "$service_name" -p User --value 2>/dev/null || true)"
+        if [ "$effective_user" = "root" ]; then
+            echo "✓ ${service_name} effective user is root"
+            continue
+        fi
+
+        failed=1
+        if [ -n "$effective_user" ]; then
+            echo "✗ ${service_name} effective user is '$effective_user' instead of 'root'"
+        else
+            echo "✗ Could not read effective user for ${service_name} from systemd"
+        fi
+    done
+
+    return "$failed"
+}
+
+restart_plugin_loader_services() {
+    local service_name
+
+    for service_name in "${PLUGIN_LOADER_SERVICE_NAMES[@]}"; do
+        echo "Restarting Decky Loader service: ${service_name}"
+        sudo systemctl restart "$service_name"
+    done
 }
 
 fetch_release_metadata() {
@@ -263,6 +309,7 @@ require_command "curl" "curl"
 require_command "python3" "Python 3"
 require_command "unzip" "unzip"
 require_command "sudo" "sudo"
+require_command "systemctl" "systemctl"
 
 if [[ "$OSTYPE" != "linux-gnu"* ]]; then
     echo "Error: This script is intended for Linux/SteamOS only."
@@ -290,6 +337,7 @@ if [ ! -d "$HOME/homebrew/plugins" ]; then
 fi
 
 echo "Installing $PLUGIN_NAME..."
+discover_plugin_loader_services
 
 if [ -d "$PLUGIN_DIR" ]; then
     echo ""
@@ -376,20 +424,28 @@ echo "================================"
 echo ""
 echo "Plugin installed to: $PLUGIN_DIR"
 echo "Installed version: $SELECTED_VERSION"
-echo "Decky service unit: $PLUGIN_LOADER_UNIT"
+echo "Decky service units:"
+printf '  - %s\n' "${PLUGIN_LOADER_SERVICE_NAMES[@]}"
 echo ""
 echo "Restarting Decky Loader..."
 
-if sudo systemctl restart "$PLUGIN_LOADER_SERVICE_NAME" 2>/dev/null; then
-    echo "✓ Decky Loader restarted successfully!"
-    verify_plugin_loader_effective_user
+restart_plugin_loader_services
+echo "✓ Decky Loader restarted successfully!"
+if ! verify_plugin_loader_effective_user; then
     echo ""
-    echo "Your plugin should now be available in the Quick Access menu."
-else
-    echo "⚠ Could not restart Decky Loader automatically."
-    echo "Please restart it manually with:"
-    echo "  sudo systemctl restart plugin_loader"
-    echo "Or reboot your device."
+    echo "Error: Decky did not come back with effective root privileges."
+    echo "Protected writes would still be broken, so AnyDeck is refusing to treat this install as healthy."
+    echo ""
+    echo "Check the Decky units and overrides:"
+    for service_name in "${PLUGIN_LOADER_SERVICE_NAMES[@]}"; do
+        echo "  sudo systemctl status ${service_name}"
+        echo "  sudo systemctl cat ${service_name}"
+    done
+    echo "Or reboot your device after confirming the overrides were written under /etc/systemd/system."
+    exit 1
 fi
+
+echo ""
+echo "Your plugin should now be available in the Quick Access menu."
 
 echo ""

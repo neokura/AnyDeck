@@ -1731,6 +1731,9 @@ class Plugin:
     def _rgb_multi_intensity_values(self, led_path: str, r: int, g: int, b: int) -> list[int]:
         index_tokens = self._rgb_multi_index_tokens(led_path)
         if index_tokens:
+            if all(token == "rgb" for token in index_tokens):
+                color_int = (r << 16) | (g << 8) | b
+                return [color_int] * len(index_tokens)
             channel_values = {
                 "red": r,
                 "green": g,
@@ -1773,7 +1776,13 @@ class Plugin:
         try:
             values = self._read_multi_intensity_values(led_path)
             index_tokens = self._rgb_multi_index_tokens(led_path)
-            if values and index_tokens:
+            if values and index_tokens and all(token == "rgb" for token in index_tokens):
+                color_int = values[0]
+                r = (color_int >> 16) & 0xFF
+                g = (color_int >> 8) & 0xFF
+                b = color_int & 0xFF
+                color = f"#{r:02X}{g:02X}{b:02X}"
+            elif values and index_tokens:
                 by_channel = dict(zip(index_tokens, values))
                 color = "#{:02X}{:02X}{:02X}".format(
                     min(max(by_channel.get("red", 0), 0), 255),

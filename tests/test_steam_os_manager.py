@@ -1445,6 +1445,38 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertEqual(values, "1194684 1194684 1194684 1194684")
         self.assertEqual(state["color"], "#123ABC")
 
+    def test_rgb_ally_multi_index_rgb_tokens_use_packed_color_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            led = os.path.join(tmpdir, "ally:rgb:joystick_rings")
+            os.makedirs(led)
+            with open(os.path.join(led, "brightness"), "w") as f:
+                f.write("255")
+            with open(os.path.join(led, "multi_index"), "w") as f:
+                f.write("rgb rgb rgb rgb")
+            with open(os.path.join(led, "multi_intensity"), "w") as f:
+                f.write("0 0 0 0")
+
+            plugin = main.Plugin()
+
+            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+                plugin,
+                "_legion_hid_candidates",
+                return_value=[],
+            ), patch(
+                "main.ALLY_LED_PATH", led
+            ), patch(
+                "main.RGB_LED_PATH_GLOBS", []
+            ):
+                success = asyncio.run(plugin.set_rgb_color("#123ABC"))
+                state = asyncio.run(plugin.get_rgb_state())
+
+            with open(os.path.join(led, "multi_intensity"), "r") as f:
+                values = f.read()
+
+        self.assertTrue(success)
+        self.assertEqual(values, "1194684 1194684 1194684 1194684")
+        self.assertEqual(state["color"], "#123ABC")
+
     def test_rgb_legacy_packed_led_format_still_works_for_ally(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             led = os.path.join(tmpdir, "ally:rgb:joystick_rings")
