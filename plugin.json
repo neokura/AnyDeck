@@ -1,7 +1,7 @@
 {
   "name": "AnyDeck",
   "author": "Neokura",
-  "flags": ["_root"],
+  "flags": ["root"],
   "api_version": 1,
   "publish": {
     "tags": ["hardware", "steamos", "amd", "handheld", "performance", "rgb", "vrr"],

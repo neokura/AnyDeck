@@ -6,6 +6,7 @@ set -euo pipefail
 PLUGIN_NAME="AnyDeck"
 PLUGIN_SLUG="anydeck"
 PLUGIN_DIR="$HOME/homebrew/plugins/$PLUGIN_NAME"
+PLUGIN_BASE_DIR="$HOME/homebrew/plugins"
 REPO_OWNER="neokura"
 REPO_NAME="AnyDeck"
 REQUESTED_VERSION="${1:-${ANYDECK_VERSION:-}}"
@@ -122,6 +123,21 @@ validate_plugin_layout() {
     fi
 
     return 0
+}
+
+normalize_plugin_ownership() {
+    local current_user
+    local current_group
+    current_user="$(id -un)"
+    current_group="$(id -gn)"
+
+    if [ -d "$PLUGIN_BASE_DIR" ]; then
+        sudo chown "$current_user:$current_group" "$PLUGIN_BASE_DIR"
+    fi
+
+    if [ -e "$PLUGIN_DIR" ]; then
+        sudo chown -R "$current_user:$current_group" "$PLUGIN_DIR"
+    fi
 }
 
 check_plugin_loader_root_mode() {
@@ -402,7 +418,7 @@ fi
 echo ""
 echo "Creating plugin directory (requires sudo permission)..."
 sudo mkdir -p "$PLUGIN_DIR"
-sudo chown -R "$(id -un):$(id -gn)" "$PLUGIN_DIR"
+normalize_plugin_ownership
 check_plugin_loader_root_mode
 ensure_plugin_loader_root_mode
 
@@ -460,7 +476,7 @@ fi
 
 echo "Installing files..."
 sudo cp -R "$EXTRACT_ROOT"/. "$PLUGIN_DIR"/
-sudo chown -R "$(id -un):$(id -gn)" "$PLUGIN_DIR"
+normalize_plugin_ownership
 
 echo "✓ Release installed successfully!"
 echo ""
