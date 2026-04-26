@@ -35,6 +35,44 @@ require_command() {
     fi
 }
 
+REQUIRED_PLUGIN_FILES=(
+    "main.py"
+    "platform_support.py"
+    "display_service.py"
+    "system_info.py"
+    "optimization_runtime.py"
+    "rgb_controller.py"
+    "rgb_support.py"
+    "optimization_support.py"
+    "optimization_ops.py"
+    "state_aggregator.py"
+    "performance_service.py"
+    "plugin.json"
+    "package.json"
+    "dist/index.js"
+)
+
+validate_plugin_layout() {
+    local root="$1"
+    local missing=()
+    local relative_path
+
+    for relative_path in "${REQUIRED_PLUGIN_FILES[@]}"; do
+        if [ ! -e "$root/$relative_path" ]; then
+            missing+=("$relative_path")
+        fi
+    done
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "Error: Release archive is incomplete and cannot be installed."
+        echo "Missing files:"
+        printf '  - %s\n' "${missing[@]}"
+        return 1
+    fi
+
+    return 0
+}
+
 check_plugin_loader_root_mode() {
     if [ ! -f "$PLUGIN_LOADER_UNIT" ]; then
         echo "⚠ Could not inspect Decky service unit: $PLUGIN_LOADER_UNIT"
@@ -282,6 +320,13 @@ EXTRACT_ROOT="$(resolve_extract_root "$TEMP_EXTRACT_DIR" || true)"
 if [ -z "$EXTRACT_ROOT" ]; then
     echo ""
     echo "Error: Release archive does not contain a valid Decky plugin layout."
+    exit 1
+fi
+
+if ! validate_plugin_layout "$EXTRACT_ROOT"; then
+    echo ""
+    echo "The published release asset appears to be truncated."
+    echo "Please publish a complete release zip, then rerun this installer."
     exit 1
 fi
 
