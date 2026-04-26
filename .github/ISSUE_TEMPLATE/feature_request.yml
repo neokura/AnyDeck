@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a new AnyDeck capability or handheld support improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the feature you want
+    validations:
+      required: true
+  - type: textarea
+    id: user_value
+    attributes:
+      label: Why it matters
+      description: Explain the user benefit or handheld use case
+    validations:
+      required: true
+  - type: input
+    id: target_device
+    attributes:
+      label: Target device
+      description: Optional, but very helpful for handheld-specific requests
+      placeholder: ASUS ROG Ally X, Lenovo Legion Go S, AYANEO, etc.
+  - type: textarea
+    id: implementation_notes
+    attributes:
+      label: Notes
+      description: Known sysfs paths, DBus interfaces, logs, screenshots, or related projects

@@ -7,7 +7,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-PLUGIN_SLUG="xbox-companion"
+PLUGIN_SLUG="anydeck"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RELEASE_DIR="$SCRIPT_DIR/release"
 
@@ -20,7 +20,7 @@ trap cleanup EXIT
 
 cd "$SCRIPT_DIR"
 
-echo -e "${GREEN}=== Xbox Companion Release Script ===${NC}"
+echo -e "${GREEN}=== AnyDeck Release Script ===${NC}"
 echo ""
 
 PACKAGE_VERSION=""

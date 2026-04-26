@@ -3,7 +3,37 @@
 STEAMOS_MIN_VERSION = (3, 8)
 ASUS_VENDOR_NAMES = {"ASUS", "ASUSTEK", "ASUSTEK COMPUTER INC."}
 LENOVO_VENDOR_NAMES = {"LENOVO"}
+GENERIC_HANDHELD_VENDOR_NAMES = {
+    "AOKZOE",
+    "AYA",
+    "AYADEVICE",
+    "AYANEO",
+    "GPD",
+    "MSI",
+    "ONEXPLAYER",
+    "ONE-NETBOOK",
+    "ZOTAC",
+    "ACER",
+}
 STEAM_DECK_VENDOR_NAMES = {"VALVE"}
+HANDHELD_IDENTIFIER_KEYWORDS = (
+    "ALLY",
+    "AYA",
+    "AYANEO",
+    "CLAW",
+    "GAMEPAD",
+    "GAMING HANDHELD",
+    "GPD",
+    "HANDHELD",
+    "LEGION",
+    "ONEX",
+    "PLAYER",
+    "PORTABLE",
+    "ROG",
+    "WIN",
+    "XBOX",
+    "Z1",
+)
 
 
 def get_steamos_version(os_release_values: dict | None = None) -> str:
@@ -53,7 +83,10 @@ def is_supported_handheld_vendor_device(
     if normalized_vendor in LENOVO_VENDOR_NAMES:
         return "LEGION" in identifiers
 
-    return False
+    if normalized_vendor in GENERIC_HANDHELD_VENDOR_NAMES:
+        return any(keyword in identifiers for keyword in HANDHELD_IDENTIFIER_KEYWORDS)
+
+    return any(keyword in identifiers for keyword in HANDHELD_IDENTIFIER_KEYWORDS)
 
 
 def parse_version_tuple(raw_version: str) -> tuple[int, int] | None:
@@ -109,14 +142,14 @@ def get_platform_support(
         return {
             "supported": False,
             "support_level": "blocked",
-            "reason": "Xbox Companion is only enabled on SteamOS 3.8 or newer.",
+            "reason": "AnyDeck is only enabled on SteamOS 3.8 or newer.",
         }
 
     if not steamos_version_is_supported(values):
         return {
             "supported": False,
             "support_level": "blocked",
-            "reason": "Xbox Companion requires SteamOS 3.8 or newer.",
+            "reason": "AnyDeck requires SteamOS 3.8 or newer.",
         }
 
     if not is_supported_handheld_vendor_device(
@@ -128,13 +161,23 @@ def get_platform_support(
         return {
             "supported": False,
             "support_level": "blocked",
-            "reason": "Xbox Companion is only enabled on ASUS and Lenovo handhelds.",
+            "reason": "AnyDeck is only enabled on non-Steam-Deck handhelds it can identify.",
         }
 
+    normalized_vendor = sys_vendor.strip().upper()
+    support_level = (
+        "supported"
+        if normalized_vendor in ASUS_VENDOR_NAMES | LENOVO_VENDOR_NAMES
+        else "experimental"
+    )
     return {
         "supported": True,
-        "support_level": "supported",
-        "reason": "Supported ASUS/Lenovo handheld on SteamOS 3.8 or newer.",
+        "support_level": support_level,
+        "reason": (
+            "Validated SteamOS handheld on SteamOS 3.8 or newer."
+            if support_level == "supported"
+            else "Experimental SteamOS handheld support on SteamOS 3.8 or newer."
+        ),
     }
 
 

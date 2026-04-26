@@ -53,7 +53,7 @@ main = importlib.import_module("main")
 SUPPORTED_PLATFORM = {
     "supported": True,
     "support_level": "supported",
-    "reason": "Supported ASUS/Lenovo handheld on SteamOS 3.8 or newer.",
+    "reason": "Validated SteamOS handheld on SteamOS 3.8 or newer.",
 }
 
 
@@ -544,7 +544,7 @@ class PluginPerformanceProfileTest(unittest.TestCase):
         self.assertEqual(second["device_family"], "steamos_handheld")
         self.assertEqual(second["support_level"], "supported")
 
-    def test_platform_support_allows_asus_and_lenovo_on_steamos_38_or_newer(self):
+    def test_platform_support_allows_validated_handhelds_on_steamos_38_or_newer(self):
         plugin = main.Plugin()
         asus = plugin._get_platform_support(
             "RC7A",
@@ -572,6 +572,7 @@ class PluginPerformanceProfileTest(unittest.TestCase):
         self.assertTrue(asus["supported"])
         self.assertEqual(asus["support_level"], "supported")
         self.assertTrue(lenovo_future["supported"])
+        self.assertEqual(lenovo_future["support_level"], "supported")
 
     def test_platform_support_allows_common_lenovo_legion_identifiers(self):
         plugin = main.Plugin()
@@ -660,12 +661,12 @@ class PluginPerformanceProfileTest(unittest.TestCase):
 
         self.assertFalse(support["supported"])
 
-    def test_platform_support_blocks_non_asus_lenovo_handhelds(self):
+    def test_platform_support_allows_generic_identified_handhelds_as_experimental(self):
         plugin = main.Plugin()
         support = plugin._get_platform_support(
-            "BOARD-A",
-            "Generic Handheld",
-            "VENDOR-A",
+            "GAMEPAD-01",
+            "AMD Gaming Handheld",
+            "AYANEO",
             "",
             {
                 "ID": "steamos",
@@ -674,8 +675,9 @@ class PluginPerformanceProfileTest(unittest.TestCase):
             },
         )
 
-        self.assertFalse(support["supported"])
-        self.assertIn("ASUS and Lenovo", support["reason"])
+        self.assertTrue(support["supported"])
+        self.assertEqual(support["support_level"], "experimental")
+        self.assertIn("Experimental", support["reason"])
 
     def test_plugin_instances_do_not_share_settings(self):
         first = main.Plugin()
@@ -1841,16 +1843,12 @@ class OptimizationStateTest(unittest.TestCase):
         self.assertTrue(state["active"])
         self.assertFalse(state["needs_reboot"])
 
-    def test_atomic_manifest_is_single_file_and_cleans_legacy_manifests(self):
+    def test_atomic_manifest_is_single_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             scx_path = os.path.join(tmpdir, "scx")
             memory_path = os.path.join(tmpdir, "memory.conf")
             thp_path = os.path.join(tmpdir, "thp.conf")
-            manifest_path = os.path.join(tmpdir, "xbox-companion.conf")
-            legacy_paths = [
-                os.path.join(tmpdir, "xbox-companion-scx.conf"),
-                os.path.join(tmpdir, "xbox-companion-memory.conf"),
-            ]
+            manifest_path = os.path.join(tmpdir, "anydeck.conf")
 
             with open(scx_path, "w") as f:
                 f.write(main.SCX_DEFAULT_CONTENT)
@@ -1858,9 +1856,6 @@ class OptimizationStateTest(unittest.TestCase):
                 f.write(main.MEMORY_SYSCTL_CONTENT)
             with open(thp_path, "w") as f:
                 f.write(main.THP_TMPFILES_CONTENT)
-            for path in legacy_paths:
-                with open(path, "w") as f:
-                    f.write("legacy\n")
 
             plugin = main.Plugin()
 
@@ -1874,27 +1869,20 @@ class OptimizationStateTest(unittest.TestCase):
                 "main.GRUB_DEFAULT_PATH", os.path.join(tmpdir, "grub")
             ), patch(
                 "main.ATOMIC_MANIFEST_PATH", manifest_path
-            ), patch(
-                "main.LEGACY_ATOMIC_PATHS", legacy_paths
-            ), patch(
-                "main.LEGACY_MANAGED_PATHS", []
             ):
                 plugin._refresh_atomic_manifest()
 
             with open(manifest_path, "r") as f:
                 manifest = f.read()
-            legacy_removed = not any(os.path.exists(path) for path in legacy_paths)
 
         self.assertIn(scx_path, manifest)
         self.assertIn(memory_path, manifest)
         self.assertIn(thp_path, manifest)
-        self.assertNotIn("xbox-companion-scx.conf", manifest)
-        self.assertTrue(legacy_removed)
 
     def test_lavd_disable_restores_previous_scx_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             scx_path = os.path.join(tmpdir, "scx")
-            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            atomic_path = os.path.join(tmpdir, "anydeck.conf")
             state_path = os.path.join(tmpdir, "optimization-state.json")
             previous = 'SCX_SCHEDULER="scx_rustland"\nSCX_FLAGS="--custom"\n'
             with open(scx_path, "w") as f:
@@ -1906,10 +1894,6 @@ class OptimizationStateTest(unittest.TestCase):
                 "main.ATOMIC_MANIFEST_PATH", atomic_path
             ), patch(
                 "main.OPTIMIZATION_STATE_PATH", state_path
-            ), patch(
-                "main.LEGACY_ATOMIC_PATHS", []
-            ), patch(
-                "main.LEGACY_MANAGED_PATHS", []
             ), patch.object(
                 plugin, "_command_exists", return_value=False
             ), patch.object(
@@ -1928,7 +1912,7 @@ class OptimizationStateTest(unittest.TestCase):
             scx_path = os.path.join(tmpdir, "scx")
             memory_path = os.path.join(tmpdir, "memory.conf")
             thp_path = os.path.join(tmpdir, "thp.conf")
-            manifest_path = os.path.join(tmpdir, "xbox-companion.conf")
+            manifest_path = os.path.join(tmpdir, "anydeck.conf")
 
             with open(scx_path, "w") as f:
                 f.write(main.SCX_DEFAULT_CONTENT)
@@ -1949,10 +1933,6 @@ class OptimizationStateTest(unittest.TestCase):
                 "main.GRUB_DEFAULT_PATH", os.path.join(tmpdir, "grub")
             ), patch(
                 "main.ATOMIC_MANIFEST_PATH", manifest_path
-            ), patch(
-                "main.LEGACY_ATOMIC_PATHS", []
-            ), patch(
-                "main.LEGACY_MANAGED_PATHS", []
             ), patch.object(
                 plugin, "_run_optional_command", return_value=""
             ):
@@ -1974,7 +1954,7 @@ class OptimizationStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_path = os.path.join(tmpdir, "memory.conf")
             thp_path = os.path.join(tmpdir, "thp.conf")
-            manifest_path = os.path.join(tmpdir, "xbox-companion.conf")
+            manifest_path = os.path.join(tmpdir, "anydeck.conf")
 
             with open(memory_path, "w") as f:
                 f.write(main.MEMORY_SYSCTL_CONTENT)
@@ -1993,10 +1973,6 @@ class OptimizationStateTest(unittest.TestCase):
                 "main.GRUB_DEFAULT_PATH", os.path.join(tmpdir, "grub")
             ), patch(
                 "main.ATOMIC_MANIFEST_PATH", manifest_path
-            ), patch(
-                "main.LEGACY_ATOMIC_PATHS", []
-            ), patch(
-                "main.LEGACY_MANAGED_PATHS", []
             ), patch.object(
                 plugin, "_run_optional_command", return_value=""
             ):
@@ -2012,7 +1988,7 @@ class OptimizationStateTest(unittest.TestCase):
             service_path = os.path.join(tmpdir, "usb.service")
             script_path = os.path.join(tmpdir, "apply-usb-wake.sh")
             config_path = os.path.join(tmpdir, "usb-wake-devices.conf")
-            manifest_path = os.path.join(tmpdir, "xbox-companion.conf")
+            manifest_path = os.path.join(tmpdir, "anydeck.conf")
             state_path = os.path.join(tmpdir, "optimization-state.json")
             wake_path = os.path.join(tmpdir, "acpi-wakeup")
 
@@ -2031,10 +2007,6 @@ class OptimizationStateTest(unittest.TestCase):
                 "main.ATOMIC_MANIFEST_PATH", manifest_path
             ), patch("main.OPTIMIZATION_STATE_PATH", state_path), patch(
                 "main.ACPI_WAKEUP_PATH", wake_path
-            ), patch(
-                "main.LEGACY_ATOMIC_PATHS", []
-            ), patch(
-                "main.LEGACY_MANAGED_PATHS", []
             ), patch.object(
                 plugin, "_command_exists", side_effect=lambda command: command == "systemctl"
             ), patch.object(
@@ -2065,7 +2037,7 @@ class OptimizationStateTest(unittest.TestCase):
             service_path = os.path.join(tmpdir, "usb.service")
             script_path = os.path.join(tmpdir, "apply-usb-wake.sh")
             config_path = os.path.join(tmpdir, "usb-wake-devices.conf")
-            manifest_path = os.path.join(tmpdir, "xbox-companion.conf")
+            manifest_path = os.path.join(tmpdir, "anydeck.conf")
             wake_path = os.path.join(tmpdir, "acpi-wakeup")
 
             plugin = main.Plugin()
@@ -2100,7 +2072,7 @@ class OptimizationStateTest(unittest.TestCase):
     def test_swap_protect_state_reports_reboot_required_when_runtime_tuning_remains_after_disable(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_path = os.path.join(tmpdir, "memory.conf")
-            manifest_path = os.path.join(tmpdir, "xbox-companion.conf")
+            manifest_path = os.path.join(tmpdir, "anydeck.conf")
 
             plugin = main.Plugin()
 
@@ -2126,7 +2098,7 @@ class OptimizationStateTest(unittest.TestCase):
     def test_kernel_param_state_uses_grub_and_atomic_manifest(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             grub_path = os.path.join(tmpdir, "grub")
-            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            atomic_path = os.path.join(tmpdir, "anydeck.conf")
             state_path = os.path.join(tmpdir, "optimization-state.json")
             with open(grub_path, "w") as f:
                 f.write('GRUB_CMDLINE_LINUX_DEFAULT="amd_pstate=active"\n')
@@ -2154,18 +2126,13 @@ class OptimizationStateTest(unittest.TestCase):
         self.assertFalse(state["needs_reboot"])
         self.assertEqual(state["status"], "active")
 
-    def test_update_grub_param_refreshes_atomic_manifest_and_removes_legacy_healer(self):
+    def test_update_grub_param_refreshes_atomic_manifest(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             grub_path = os.path.join(tmpdir, "grub")
-            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            atomic_path = os.path.join(tmpdir, "anydeck.conf")
             state_path = os.path.join(tmpdir, "optimization-state.json")
-            legacy_script = os.path.join(tmpdir, "grub-healer.sh")
-            legacy_service = os.path.join(tmpdir, "grub-healer.service")
             with open(grub_path, "w") as f:
                 f.write('GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n')
-            for path in [legacy_script, legacy_service]:
-                with open(path, "w") as f:
-                    f.write("legacy\n")
 
             plugin = main.Plugin()
 
@@ -2173,10 +2140,6 @@ class OptimizationStateTest(unittest.TestCase):
                 "main.ATOMIC_MANIFEST_PATH", atomic_path
             ), patch(
                 "main.OPTIMIZATION_STATE_PATH", state_path
-            ), patch(
-                "main.LEGACY_MANAGED_PATHS", [legacy_script, legacy_service]
-            ), patch(
-                "main.LEGACY_ATOMIC_PATHS", []
             ), patch.object(
                 plugin, "_is_amd_platform", return_value=True
             ), patch.object(
@@ -2191,13 +2154,11 @@ class OptimizationStateTest(unittest.TestCase):
 
         self.assertIn("quiet amd_pstate=active", grub_contents)
         self.assertIn(grub_path, manifest)
-        self.assertFalse(os.path.exists(legacy_script))
-        self.assertFalse(os.path.exists(legacy_service))
 
     def test_kernel_param_disable_preserves_preexisting_grub_setting(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             grub_path = os.path.join(tmpdir, "grub")
-            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            atomic_path = os.path.join(tmpdir, "anydeck.conf")
             state_path = os.path.join(tmpdir, "optimization-state.json")
             with open(grub_path, "w") as f:
                 f.write('GRUB_CMDLINE_LINUX_DEFAULT="quiet amd_pstate=active"\n')
@@ -2208,10 +2169,6 @@ class OptimizationStateTest(unittest.TestCase):
                 "main.ATOMIC_MANIFEST_PATH", atomic_path
             ), patch(
                 "main.OPTIMIZATION_STATE_PATH", state_path
-            ), patch(
-                "main.LEGACY_ATOMIC_PATHS", []
-            ), patch(
-                "main.LEGACY_MANAGED_PATHS", []
             ), patch.object(
                 plugin, "_is_amd_platform", return_value=True
             ), patch.object(
@@ -2229,7 +2186,7 @@ class OptimizationStateTest(unittest.TestCase):
     def test_swap_protect_disable_restores_previous_runtime_sysctls(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_path = os.path.join(tmpdir, "memory.conf")
-            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            atomic_path = os.path.join(tmpdir, "anydeck.conf")
             state_path = os.path.join(tmpdir, "optimization-state.json")
             writes = []
 
@@ -2246,10 +2203,6 @@ class OptimizationStateTest(unittest.TestCase):
                 "main.ATOMIC_MANIFEST_PATH", atomic_path
             ), patch(
                 "main.OPTIMIZATION_STATE_PATH", state_path
-            ), patch(
-                "main.LEGACY_ATOMIC_PATHS", []
-            ), patch(
-                "main.LEGACY_MANAGED_PATHS", []
             ), patch.object(
                 plugin, "_read_sysctl", side_effect=fake_read_sysctl
             ), patch.object(
@@ -2288,9 +2241,7 @@ class OptimizationStateTest(unittest.TestCase):
     def test_optimization_states_are_exposed_as_granular_controls(self):
         plugin = main.Plugin()
 
-        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
-            plugin, "_migrate_atomic_manifest_if_needed", return_value=None
-        ), patch.object(plugin, "_command_exists", return_value=True), patch.object(
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(plugin, "_command_exists", return_value=True), patch.object(
             plugin, "_is_amd_platform", return_value=True
         ), patch.object(plugin, "_amd_npu_present", return_value=True), patch.object(
             plugin, "_usb_wake_control_available", return_value=True

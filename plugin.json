@@ -1,11 +1,11 @@
 {
-  "name": "Xbox Companion",
+  "name": "AnyDeck",
   "author": "Neokura",
   "flags": ["_root"],
   "api_version": 1,
   "publish": {
-    "tags": ["hardware", "asus", "lenovo", "steamos", "performance", "vrr"],
-    "description": "ASUS/Lenovo SteamOS handheld control center with native performance modes, VRR, VSync, battery, RGB, and diagnostics.",
-    "image": "https://github.com/neokura/XboxCompanion/raw/main/icons/icon.png"
+    "tags": ["hardware", "steamos", "amd", "handheld", "performance", "rgb", "vrr"],
+    "description": "SteamOS handheld control center for AMD x86 devices with native performance modes, display controls, battery limits, RGB, diagnostics, and system optimizations.",
+    "image": "https://github.com/neokura/AnyDeck/raw/main/icons/icon.png"
   }
 }

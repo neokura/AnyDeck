@@ -13,7 +13,7 @@ import { callable, toaster } from "@decky/api";
 const { useEffect, useState } = window.SP_REACT;
 type VFC<P = {}> = (props: P) => JSX.Element | null;
 
-const PLUGIN_NAME = "Xbox Companion";
+const PLUGIN_NAME = "AnyDeck";
 const RGB_PRESETS = [
   "#FF0000",
   "#00FFFF",
@@ -2016,7 +2016,7 @@ const InformationView: VFC<{
   );
 };
 
-const XboxCompanionContent: VFC = () => {
+const AnyDeckContent: VFC = () => {
   const [view, setView] = useState<ViewName>("dashboard");
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
   const [optimizations, setOptimizations] = useState<OptimizationData | null>(null);
@@ -2179,22 +2179,22 @@ const XboxCompanionContent: VFC = () => {
   );
 };
 
-const XboxCompanionIcon: VFC = () => (
+const AnyDeckIcon: VFC = () => (
   <svg viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em">
     <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" />
   </svg>
 );
 
 export default definePlugin(() => {
-  console.log("Xbox Companion plugin loaded!");
+  console.log("AnyDeck plugin loaded!");
 
   return {
-    name: "Xbox Companion",
-    title: <div className={staticClasses.Title}>Xbox Companion</div>,
-    content: <XboxCompanionContent />,
-    icon: <XboxCompanionIcon />,
+    name: "AnyDeck",
+    title: <div className={staticClasses.Title}>AnyDeck</div>,
+    content: <AnyDeckContent />,
+    icon: <AnyDeckIcon />,
     onDismount() {
-      console.log("Xbox Companion plugin unloaded!");
+      console.log("AnyDeck plugin unloaded!");
     },
   };
 });

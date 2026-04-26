@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a reproducible problem in AnyDeck
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Handheld model and vendor
+      placeholder: Lenovo Legion Go, ASUS ROG Ally, AYANEO 2, etc.
+    validations:
+      required: true
+  - type: input
+    id: steamos_version
+    attributes:
+      label: SteamOS version
+      placeholder: 3.8.x / 3.9.x
+    validations:
+      required: true
+  - type: dropdown
+    id: support_level
+    attributes:
+      label: Support tier
+      options:
+        - Validated support device
+        - Experimental support device
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened
+      description: Describe the failure and the exact feature involved
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste relevant information from the Information view, debug log, or terminal output

@@ -12,20 +12,11 @@ def refresh_atomic_manifest(
     entries: list[str],
     write_managed_file,
     remove_file,
-    cleanup_legacy_managed_files,
-    cleanup_legacy_atomic_manifests,
 ) -> None:
-    cleanup_legacy_managed_files()
     if entries:
         write_managed_file(manifest_path, "\n".join(entries) + "\n")
     else:
         remove_file(manifest_path)
-    cleanup_legacy_atomic_manifests()
-
-
-def migrate_atomic_manifest_if_needed(*, legacy_atomic_paths: list[str], host_file_exists, refresh_atomic_manifest_fn) -> None:
-    if any(host_file_exists(path) for path in legacy_atomic_paths):
-        refresh_atomic_manifest_fn()
 
 
 def remove_managed_file(

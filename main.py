@@ -1,5 +1,5 @@
 """
-Xbox Companion - Decky Loader Plugin Backend
+AnyDeck - Decky Loader Plugin Backend
 SteamOS handheld control and SteamOS-native system management
 
 Licensed under MIT
@@ -55,7 +55,6 @@ from optimization_support import (
     remember_kernel_param_state,
 )
 from optimization_ops import (
-    migrate_atomic_manifest_if_needed,
     pop_optimization_state_value,
     read_optimization_state,
     refresh_atomic_manifest,
@@ -117,7 +116,7 @@ RGB_LED_PATH_GLOBS = [
     "/sys/class/leds/*joystick*ring*",
 ]
 
-PLUGIN_NAME = "Xbox Companion"
+PLUGIN_NAME = "AnyDeck"
 
 STEAMOS_MANAGER_SERVICE = "com.steampowered.SteamOSManager1"
 STEAMOS_MANAGER_OBJECT = "/com/steampowered/SteamOSManager1"
@@ -208,24 +207,14 @@ ASUS_ALLY_HID = {
 ATOMIC_UPDATE_DIR = "/etc/atomic-update.conf.d"
 
 SCX_DEFAULT_PATH = "/etc/default/scx"
-MEMORY_SYSCTL_PATH = "/etc/sysctl.d/99-xbox-companion-memory-tuning.conf"
-THP_TMPFILES_PATH = "/etc/tmpfiles.d/xbox-companion-thp.conf"
-NPU_BLACKLIST_PATH = "/etc/modprobe.d/blacklist-xbox-companion-npu.conf"
-USB_WAKE_SERVICE_PATH = "/etc/systemd/system/xbox-companion-disable-usb-wake.service"
-USB_WAKE_SCRIPT_PATH = "/etc/xbox-companion/apply-usb-wake.sh"
-USB_WAKE_CONFIG_PATH = "/etc/xbox-companion/usb-wake-devices.conf"
-ATOMIC_MANIFEST_PATH = f"{ATOMIC_UPDATE_DIR}/xbox-companion.conf"
-OPTIMIZATION_STATE_PATH = "/var/lib/xbox-companion/optimization-state.json"
-LEGACY_ATOMIC_PATHS = [
-    f"{ATOMIC_UPDATE_DIR}/xbox-companion-scx.conf",
-    f"{ATOMIC_UPDATE_DIR}/xbox-companion-memory.conf",
-    f"{ATOMIC_UPDATE_DIR}/xbox-companion-power.conf",
-    f"{ATOMIC_UPDATE_DIR}/xbox-companion-grub-healer.conf",
-]
-LEGACY_MANAGED_PATHS = [
-    "/etc/xbox-companion-grub-healer.sh",
-    "/etc/systemd/system/xbox-companion-grub-healer.service",
-]
+MEMORY_SYSCTL_PATH = "/etc/sysctl.d/99-anydeck-memory-tuning.conf"
+THP_TMPFILES_PATH = "/etc/tmpfiles.d/anydeck-thp.conf"
+NPU_BLACKLIST_PATH = "/etc/modprobe.d/blacklist-anydeck-npu.conf"
+USB_WAKE_SERVICE_PATH = "/etc/systemd/system/anydeck-disable-usb-wake.service"
+USB_WAKE_SCRIPT_PATH = "/etc/anydeck/apply-usb-wake.sh"
+USB_WAKE_CONFIG_PATH = "/etc/anydeck/usb-wake-devices.conf"
+ATOMIC_MANIFEST_PATH = f"{ATOMIC_UPDATE_DIR}/anydeck.conf"
+OPTIMIZATION_STATE_PATH = "/var/lib/anydeck/optimization-state.json"
 GRUB_DEFAULT_PATH = "/etc/default/grub"
 CPU_BOOST_PATH = "/sys/devices/system/cpu/cpufreq/boost"
 THP_ENABLED_PATH = "/sys/kernel/mm/transparent_hugepage/enabled"
@@ -2062,14 +2051,6 @@ class Plugin:
         except Exception as e:
             decky.logger.warning(f"Failed to remove {path}: {e}")
 
-    def _cleanup_legacy_atomic_manifests(self):
-        for path in LEGACY_ATOMIC_PATHS:
-            self._remove_file(path)
-
-    def _cleanup_legacy_managed_files(self):
-        for path in LEGACY_MANAGED_PATHS:
-            self._remove_file(path)
-
     def _atomic_managed_entries(self) -> list[str]:
         checks = [
             (SCX_DEFAULT_PATH, ['SCX_SCHEDULER="scx_lavd"', 'SCX_FLAGS="--performance"']),
@@ -2079,9 +2060,9 @@ class Plugin:
             ),
             (THP_TMPFILES_PATH, ["madvise"]),
             (NPU_BLACKLIST_PATH, ["blacklist amdxdna"]),
-            (USB_WAKE_SERVICE_PATH, ["Xbox Companion - Block USB Wake"]),
-            (USB_WAKE_SCRIPT_PATH, ["xbox-companion-usb-wake"]),
-            (USB_WAKE_CONFIG_PATH, ["# xbox-companion-usb-wake"]),
+            (USB_WAKE_SERVICE_PATH, ["AnyDeck - Block USB Wake"]),
+            (USB_WAKE_SCRIPT_PATH, ["anydeck-usb-wake"]),
+            (USB_WAKE_CONFIG_PATH, ["# anydeck-usb-wake"]),
         ]
         return atomic_managed_entries(
             checks,
@@ -2097,19 +2078,10 @@ class Plugin:
             entries=self._atomic_managed_entries(),
             write_managed_file=self._write_managed_file,
             remove_file=self._remove_file,
-            cleanup_legacy_managed_files=self._cleanup_legacy_managed_files,
-            cleanup_legacy_atomic_manifests=self._cleanup_legacy_atomic_manifests,
         )
 
     def _atomic_manifest_contains(self, paths: list[str]) -> bool:
         return self._file_contains_all(ATOMIC_MANIFEST_PATH, paths)
-
-    def _migrate_atomic_manifest_if_needed(self):
-        migrate_atomic_manifest_if_needed(
-            legacy_atomic_paths=LEGACY_ATOMIC_PATHS,
-            host_file_exists=self._host_file_exists,
-            refresh_atomic_manifest_fn=self._refresh_atomic_manifest,
-        )
 
     def _remove_managed_file(
         self,
@@ -2399,7 +2371,7 @@ class Plugin:
 
     def _usb_wake_service_content(self) -> str:
         return f"""[Unit]
-Description=Xbox Companion - Block USB Wake
+Description=AnyDeck - Block USB Wake
 ConditionPathExists={USB_WAKE_SCRIPT_PATH}
 ConditionPathExists={USB_WAKE_CONFIG_PATH}
 ConditionPathExists={ACPI_WAKEUP_PATH}
@@ -2426,7 +2398,7 @@ WAKE_PATH="${2:-}"
 [ -r "$CONFIG_PATH" ] || exit 0
 [ -w "$WAKE_PATH" ] || exit 0
 
-# xbox-companion-usb-wake
+# anydeck-usb-wake
 while IFS= read -r device || [ -n "$device" ]; do
   case "$device" in
     ""|"#"*)
@@ -2449,7 +2421,7 @@ done < "$CONFIG_PATH"
                 continue
             seen.add(normalized)
             unique_devices.append(normalized)
-        lines = ["# xbox-companion-usb-wake", *unique_devices]
+        lines = ["# anydeck-usb-wake", *unique_devices]
         return "\n".join(lines) + "\n"
 
     def _set_acpi_wake_devices(self, devices: list[str]):
@@ -2637,20 +2609,10 @@ done < "$CONFIG_PATH"
         atomic = self._atomic_manifest_contains(
             [USB_WAKE_SERVICE_PATH, USB_WAKE_SCRIPT_PATH, USB_WAKE_CONFIG_PATH]
         )
-        legacy_service = service_configured and self._file_contains_all(
-            USB_WAKE_SERVICE_PATH,
-            ["ExecStart=/bin/sh -c", '/proc/acpi/wakeup'],
-        )
         service_enabled = self._service_enabled(service_name)
         service_active = self._service_active(service_name)
         configured_devices = self._read_usb_wake_configured_devices()
-        if not configured_devices and legacy_service:
-            previous_devices = self._read_optimization_state().get("usb_wake_enabled_devices", [])
-            if isinstance(previous_devices, list):
-                configured_devices = [str(device).strip() for device in previous_devices if str(device).strip()]
-        enabled = service_configured and service_enabled and (
-            (script_configured and config_configured and atomic) or legacy_service
-        )
+        enabled = service_configured and script_configured and config_configured and service_enabled and atomic
         enabled_devices = set(self._read_acpi_wake_enabled_devices())
         runtime_active = bool(configured_devices) and all(
             device not in enabled_devices for device in configured_devices
@@ -2714,8 +2676,6 @@ done < "$CONFIG_PATH"
                     )
                 ],
             }
-
-        self._migrate_atomic_manifest_if_needed()
 
         return {
             "states": [definition["state_reader"]() for definition in self._optimization_registry()],

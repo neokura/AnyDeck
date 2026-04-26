@@ -46,13 +46,13 @@ jobs:
             VERSION="$(node -p "require('./package.json').version")"
           fi
           ./release.sh "$VERSION"
-          ZIP_NAME="xbox-companion-v${VERSION}.zip"
+          ZIP_NAME="anydeck-v${VERSION}.zip"
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: xbox-companion-release
+          name: anydeck-release
           path: release/*.zip
           if-no-files-found: error
 

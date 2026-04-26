@@ -1,14 +1,14 @@
 #!/bin/bash
-# Xbox Companion - Installation Script
+# AnyDeck - Installation Script
 # Author: neokura
 set -euo pipefail
 
-PLUGIN_NAME="Xbox Companion"
-PLUGIN_SLUG="xbox-companion"
+PLUGIN_NAME="AnyDeck"
+PLUGIN_SLUG="anydeck"
 PLUGIN_DIR="$HOME/homebrew/plugins/$PLUGIN_NAME"
 REPO_OWNER="neokura"
-REPO_NAME="XboxCompanion"
-REQUESTED_VERSION="${1:-${XBOX_COMPANION_VERSION:-}}"
+REPO_NAME="AnyDeck"
+REQUESTED_VERSION="${1:-${ANYDECK_VERSION:-}}"
 
 TEMP_FILES=()
 cleanup() {
@@ -40,7 +40,7 @@ import urllib.request
 owner, repo, requested = sys.argv[1:4]
 headers = {
     "Accept": "application/vnd.github+json",
-    "User-Agent": "XboxCompanionInstaller/1.0",
+    "User-Agent": "AnyDeckInstaller/1.0",
 }
 
 urls = []
@@ -116,7 +116,7 @@ resolve_extract_root() {
 }
 
 echo "================================"
-echo "  Xbox Companion Installer"
+echo "  AnyDeck Installer"
 echo "  alpha release by neokura"
 echo "================================"
 echo ""
@@ -133,7 +133,7 @@ fi
 if [ ! -d "$HOME/homebrew/plugins" ]; then
     echo "Decky Loader does not appear to be installed."
     echo ""
-    echo "Xbox Companion is a Decky plugin, so Decky must be installed first."
+    echo "AnyDeck is a Decky plugin, so Decky must be installed first."
     echo "Decky website: https://decky.xyz/"
     echo ""
     read -p "Open the Decky website now? (Y/n): " -n 1 -r
