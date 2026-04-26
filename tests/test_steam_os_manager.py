@@ -414,6 +414,19 @@ class HostRuntimeTest(unittest.TestCase):
         self.assertEqual(env["XAUTHORITY"], "/run/user/1000/xauth_test")
         self.assertEqual(env["GAMESCOPE_WAYLAND_DISPLAY"], "gamescope-0")
 
+    def test_run_allows_mocked_commands_even_when_resolution_fails(self):
+        runtime = main.HostRuntime()
+
+        with patch.object(
+            runtime,
+            "resolve_command",
+            return_value={"available": False, "path": "", "via_host": False},
+        ), patch("main.subprocess.run", return_value=subprocess.CompletedProcess(["xprop"], 0, "", "")) as run_mock:
+            result = runtime.run(["xprop", "-root"])
+
+        self.assertEqual(result.returncode, 0)
+        run_mock.assert_called_once()
+
 
 class GamescopeSettingsClientTest(unittest.TestCase):
     def test_reads_gamescope_display_sync_state(self):
@@ -1993,6 +2006,96 @@ class OptimizationStateTest(unittest.TestCase):
                 manifest_exists = os.path.exists(manifest_path)
 
         self.assertFalse(manifest_exists)
+
+    def test_usb_wake_enable_writes_managed_files_and_captures_enabled_devices(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service_path = os.path.join(tmpdir, "usb.service")
+            script_path = os.path.join(tmpdir, "apply-usb-wake.sh")
+            config_path = os.path.join(tmpdir, "usb-wake-devices.conf")
+            manifest_path = os.path.join(tmpdir, "xbox-companion.conf")
+            state_path = os.path.join(tmpdir, "optimization-state.json")
+            wake_path = os.path.join(tmpdir, "acpi-wakeup")
+
+            with open(wake_path, "w") as f:
+                f.write(
+                    "XHC0\tS4\t*enabled\n"
+                    "USB1\tS3\t*disabled\n"
+                    "PBTN\tS4\t*enabled\n"
+                )
+
+            plugin = main.Plugin()
+
+            with patch("main.USB_WAKE_SERVICE_PATH", service_path), patch(
+                "main.USB_WAKE_SCRIPT_PATH", script_path
+            ), patch("main.USB_WAKE_CONFIG_PATH", config_path), patch(
+                "main.ATOMIC_MANIFEST_PATH", manifest_path
+            ), patch("main.OPTIMIZATION_STATE_PATH", state_path), patch(
+                "main.ACPI_WAKEUP_PATH", wake_path
+            ), patch(
+                "main.LEGACY_ATOMIC_PATHS", []
+            ), patch(
+                "main.LEGACY_MANAGED_PATHS", []
+            ), patch.object(
+                plugin, "_command_exists", side_effect=lambda command: command == "systemctl"
+            ), patch.object(
+                plugin, "_systemctl", return_value=""
+            ) as systemctl:
+                plugin._set_usb_wake_enabled(True)
+
+            with open(config_path, "r") as f:
+                config_content = f.read()
+            with open(state_path, "r") as f:
+                state = json.load(f)
+            with open(manifest_path, "r") as f:
+                manifest = f.read()
+
+            self.assertIn("XHC0", config_content)
+            self.assertIn("USB1", config_content)
+            self.assertNotIn("PBTN", config_content)
+            self.assertEqual(state["usb_wake_enabled_devices"], ["XHC0"])
+            self.assertIn(service_path, manifest)
+            self.assertIn(script_path, manifest)
+            self.assertIn(config_path, manifest)
+            self.assertTrue(os.stat(script_path).st_mode & 0o111)
+            systemctl.assert_any_call("daemon-reload")
+            systemctl.assert_any_call("enable", "--now", os.path.basename(service_path))
+
+    def test_usb_wake_state_reports_inactive_when_configured_device_is_still_enabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service_path = os.path.join(tmpdir, "usb.service")
+            script_path = os.path.join(tmpdir, "apply-usb-wake.sh")
+            config_path = os.path.join(tmpdir, "usb-wake-devices.conf")
+            manifest_path = os.path.join(tmpdir, "xbox-companion.conf")
+            wake_path = os.path.join(tmpdir, "acpi-wakeup")
+
+            plugin = main.Plugin()
+
+            with patch("main.USB_WAKE_SERVICE_PATH", service_path), patch(
+                "main.USB_WAKE_SCRIPT_PATH", script_path
+            ), patch("main.USB_WAKE_CONFIG_PATH", config_path), patch(
+                "main.ATOMIC_MANIFEST_PATH", manifest_path
+            ), patch("main.ACPI_WAKEUP_PATH", wake_path):
+                with open(service_path, "w") as f:
+                    f.write(plugin._usb_wake_service_content())
+                with open(script_path, "w") as f:
+                    f.write(plugin._usb_wake_script_content())
+                with open(config_path, "w") as f:
+                    f.write(plugin._usb_wake_config_content(["XHC0"]))
+                with open(manifest_path, "w") as f:
+                    f.write(f"{service_path}\n{script_path}\n{config_path}\n")
+                with open(wake_path, "w") as f:
+                    f.write("XHC0\tS4\t*enabled\n")
+
+                with patch.object(plugin, "_command_exists", side_effect=lambda command: command == "systemctl"), patch.object(
+                    plugin, "_service_enabled", return_value=True
+                ), patch.object(
+                    plugin, "_service_active", return_value=True
+                ):
+                    state = plugin._get_usb_wake_state()
+
+            self.assertTrue(state["enabled"])
+            self.assertFalse(state["active"])
+            self.assertIn("XHC0", state["details"])
 
     def test_swap_protect_state_reports_reboot_required_when_runtime_tuning_remains_after_disable(self):
         with tempfile.TemporaryDirectory() as tmpdir:

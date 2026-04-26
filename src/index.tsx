@@ -2,7 +2,8 @@ import {
   definePlugin,
   PanelSection,
   PanelSectionRow,
-  ButtonItem,
+  DialogButton,
+  Focusable,
   SliderField,
   ToggleField,
   staticClasses,
@@ -43,6 +44,11 @@ const RGB_SPEED_LABELS: Record<string, string> = {
   low: "Low",
   medium: "Medium",
   high: "High",
+};
+const RGB_SPEED_DESCRIPTIONS: Record<string, string> = {
+  low: "Smoother and slower animation",
+  medium: "Default native cadence",
+  high: "Fastest native animation",
 };
 
 const clamp = (value: number, min: number, max: number): number =>
@@ -422,6 +428,90 @@ const performanceModeGridStyle: React.CSSProperties = {
   width: "100%",
 };
 
+const nativeButtonCellStyle: React.CSSProperties = {
+  minWidth: 0,
+};
+
+const nativeDialogButtonStyle = (
+  active: boolean,
+  disabled: boolean
+): React.CSSProperties => ({
+  width: "100%",
+  minWidth: 0,
+  padding: "10px 8px",
+  opacity: disabled ? 0.5 : 1,
+  boxShadow: active ? "inset 0 0 0 1px rgba(96, 165, 250, 0.6)" : "none",
+});
+
+const nativeButtonContentStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: "6px",
+  width: "100%",
+  minWidth: 0,
+  textAlign: "center",
+};
+
+const nativeButtonTextBlockStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  gap: "3px",
+  width: "100%",
+  minWidth: 0,
+};
+
+const nativeButtonTitleStyle = (active: boolean): React.CSSProperties => ({
+  color: active ? "#dbeafe" : "#ffffff",
+  fontWeight: 700,
+  fontSize: "11px",
+  lineHeight: 1.2,
+  overflowWrap: "anywhere",
+});
+
+const nativeButtonDescriptionStyle = (active: boolean): React.CSSProperties => ({
+  color: active ? "#bfdbfe" : "#9aa6b2",
+  fontSize: "9px",
+  lineHeight: 1.25,
+  overflowWrap: "anywhere",
+});
+
+const nativeButtonBadgeStyle = (
+  active: boolean,
+  disabled: boolean
+): React.CSSProperties => ({
+  marginTop: "2px",
+  padding: "2px 8px",
+  borderRadius: "999px",
+  fontSize: "9px",
+  fontWeight: 700,
+  lineHeight: 1.2,
+  color: disabled ? "#94a3b8" : active ? "#dbeafe" : "#cbd5e1",
+  background: active ? "rgba(59, 130, 246, 0.24)" : "rgba(255,255,255,0.08)",
+});
+
+const actionButtonRowStyle: React.CSSProperties = {
+  display: "flex",
+  gap: "8px",
+  width: "100%",
+};
+
+const actionButtonCellStyle: React.CSSProperties = {
+  flex: "1 1 0",
+  minWidth: 0,
+};
+
+const secondaryActionButtonStyle = (
+  disabled: boolean
+): React.CSSProperties => ({
+  width: "100%",
+  minWidth: 0,
+  padding: "10px 12px",
+  opacity: disabled ? 0.5 : 1,
+});
+
 const rgbHeroStyle = (enabled: boolean, color: string): React.CSSProperties => ({
   borderRadius: "8px",
   padding: "14px",
@@ -480,34 +570,6 @@ const rgbQuickSwatchButtonStyle = (
   cursor: "pointer",
 });
 
-const rgbModeButtonStyle = (active: boolean): React.CSSProperties => ({
-  width: "100%",
-  borderRadius: "10px",
-  padding: "10px 8px",
-  textAlign: "left",
-  background: active
-    ? "linear-gradient(180deg, #60a5fa, #3b82f6)"
-    : "linear-gradient(180deg, rgba(51,65,85,0.92), rgba(30,41,59,0.92))",
-  border: active
-    ? "1px solid rgba(191, 219, 254, 0.9)"
-    : "1px solid rgba(100, 116, 139, 0.35)",
-});
-
-const compactModeButtonStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
-  width: "100%",
-  minWidth: 0,
-  borderRadius: "12px",
-  padding: "10px 8px",
-  background: active
-    ? "linear-gradient(180deg, #60a5fa, #3b82f6)"
-    : "linear-gradient(180deg, rgba(51,65,85,0.9), rgba(30,41,59,0.9))",
-  border: active
-    ? "1px solid rgba(191, 219, 254, 0.9)"
-    : "1px solid rgba(100, 116, 139, 0.35)",
-  opacity: disabled ? 0.45 : 1,
-  overflow: "hidden",
-});
-
 const statusColor = (status: string): string => {
   switch (status) {
     case "active":
@@ -555,15 +617,20 @@ const PerformanceModeGlyph: VFC<{ modeId: string; active: boolean }> = ({
   modeId,
   active,
 }) => {
-  const stroke = active ? "#0f172a" : "#e2e8f0";
+  const stroke = active ? "#dbeafe" : "#e2e8f0";
   const fill = "none";
 
   if (modeId === "low-power") {
     return (
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-        <rect x="6" y="8" width="10" height="8" rx="2" stroke={stroke} strokeWidth="1.8" fill={fill} />
-        <path d="M17 10.5H18.5V13.5H17" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
-        <path d="M8.5 12H10.4" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
+        <path
+          d="M14.8 4.5C11.2 6.3 9.2 9.3 9.2 12.6C9.2 16 11.4 18.5 14.6 18.5C17.2 18.5 19 16.7 19 14.1C19 11.2 16.9 9.5 14.3 9.6C15.3 8.4 15.8 6.8 15.8 5.2C15.8 4.8 15.4 4.5 14.8 4.5Z"
+          stroke={stroke}
+          strokeWidth="1.8"
+          fill={fill}
+          strokeLinejoin="round"
+        />
+        <path d="M12 13.4C12.9 12.5 14.1 12 15.4 12" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
       </svg>
     );
   }
@@ -571,18 +638,83 @@ const PerformanceModeGlyph: VFC<{ modeId: string; active: boolean }> = ({
   if (modeId === "balanced") {
     return (
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-        <path d="M12 5L18 8.5V15.5L12 19L6 15.5V8.5L12 5Z" stroke={stroke} strokeWidth="1.8" fill={fill} />
-        <path d="M9 12H15" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
+        <path d="M12 5V8" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
+        <path d="M7 9H17" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
+        <path d="M8.5 9L6.8 15.5C6.5 16.8 7.5 18 8.8 18H10.8C12 18 13 17 13 15.8V9" stroke={stroke} strokeWidth="1.8" fill={fill} strokeLinejoin="round" />
+        <path d="M15.5 9L17.2 15.5C17.5 16.8 16.5 18 15.2 18H13.2C12 18 11 17 11 15.8V9" stroke={stroke} strokeWidth="1.8" fill={fill} strokeLinejoin="round" />
       </svg>
     );
   }
 
   return (
     <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-      <path d="M13 3L6 13H11L10 21L18 10H13L13 3Z" stroke={stroke} strokeWidth="1.8" fill={fill} strokeLinejoin="round" />
+      <path d="M5 15.5C5 10.8 8.4 7 12 7C15.6 7 19 10.8 19 15.5" stroke={stroke} strokeWidth="1.8" fill={fill} strokeLinecap="round" />
+      <path d="M12 12L15.5 10.2" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" />
+      <circle cx="12" cy="15.5" r="1.2" fill={stroke} />
     </svg>
   );
 };
+
+interface NativeOptionButtonProps {
+  title: string;
+  description?: string;
+  status?: string;
+  active?: boolean;
+  disabled?: boolean;
+  icon?: JSX.Element;
+  onClick: () => void;
+}
+
+const NativeOptionButton: VFC<NativeOptionButtonProps> = ({
+  title,
+  description,
+  status,
+  active = false,
+  disabled = false,
+  icon,
+  onClick,
+}) => (
+  <Focusable style={nativeButtonCellStyle}>
+    <DialogButton
+      style={nativeDialogButtonStyle(active, disabled)}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <div style={nativeButtonContentStyle}>
+        {icon}
+        <div style={nativeButtonTextBlockStyle}>
+          <div style={nativeButtonTitleStyle(active)}>{title}</div>
+          {description && (
+            <div style={nativeButtonDescriptionStyle(active)}>{description}</div>
+          )}
+        </div>
+        {status && <div style={nativeButtonBadgeStyle(active, disabled)}>{status}</div>}
+      </div>
+    </DialogButton>
+  </Focusable>
+);
+
+interface SecondaryActionButtonProps {
+  label: string;
+  disabled?: boolean;
+  onClick: () => void;
+}
+
+const SecondaryActionButton: VFC<SecondaryActionButtonProps> = ({
+  label,
+  disabled = false,
+  onClick,
+}) => (
+  <Focusable style={actionButtonCellStyle}>
+    <DialogButton
+      style={secondaryActionButtonStyle(disabled)}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {label}
+    </DialogButton>
+  </Focusable>
+);
 
 const hardwareControlLabels: Record<string, string> = {
   performance_profiles: "SteamOS profiles",
@@ -641,9 +773,9 @@ const ViewHeader: VFC<{
   <PanelSection>
     {onBack && (
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={onBack}>
-          {backLabel || "Back"}
-        </ButtonItem>
+        <div style={actionButtonRowStyle}>
+          <SecondaryActionButton label={backLabel || "Back"} onClick={onBack} />
+        </div>
       </PanelSectionRow>
     )}
     <PanelSectionRow>
@@ -813,9 +945,9 @@ const DashboardView: VFC<{
         )}
         {!loading && (
           <PanelSectionRow>
-            <ButtonItem layout="below" onClick={() => void onRefresh()}>
-              Retry
-            </ButtonItem>
+            <div style={actionButtonRowStyle}>
+              <SecondaryActionButton label="Retry" onClick={() => void onRefresh()} />
+            </div>
           </PanelSectionRow>
         )}
       </PanelSection>
@@ -851,49 +983,16 @@ const DashboardView: VFC<{
       <PanelSectionRow>
         <div style={performanceModeGridStyle}>
           {data.performance_modes.map((mode) => (
-            <ButtonItem
+            <NativeOptionButton
               key={mode.id}
-              layout="below"
-              onClick={() => handlePerformanceProfile(mode.native_id, mode.label)}
+              title={mode.label}
+              description={mode.description}
+              status={mode.active ? "Active" : mode.available ? "Ready" : "Unavailable"}
+              active={mode.active}
               disabled={!mode.available || controlsDisabled}
-            >
-              <div style={compactModeButtonStyle(mode.active, !mode.available || controlsDisabled)}>
-                <div
-                  style={{
-                    display: "flex",
-                    flexDirection: "column",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    gap: "6px",
-                    textAlign: "center",
-                    minWidth: 0,
-                  }}
-                >
-                  <PerformanceModeGlyph modeId={mode.id} active={mode.active} />
-                  <div
-                    style={{
-                      color: mode.active ? "#0f172a" : "#ffffff",
-                      fontWeight: 800,
-                      fontSize: "11px",
-                      lineHeight: 1.2,
-                      overflowWrap: "anywhere",
-                    }}
-                  >
-                    {mode.label}
-                  </div>
-                  <div
-                    style={{
-                      color: mode.active ? "rgba(15,23,42,0.82)" : "#94a3b8",
-                      fontSize: "10px",
-                      fontWeight: 700,
-                      lineHeight: 1.2,
-                    }}
-                  >
-                    {mode.active ? "Active" : mode.available ? "Ready" : "Unavailable"}
-                  </div>
-                </div>
-              </div>
-            </ButtonItem>
+              icon={<PerformanceModeGlyph modeId={mode.id} active={mode.active} />}
+              onClick={() => handlePerformanceProfile(mode.native_id, mode.label)}
+            />
           ))}
         </div>
       </PanelSectionRow>
@@ -991,19 +1090,11 @@ const DashboardView: VFC<{
       </PanelSectionRow>
 
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={onOpenRgb}>
-          RGB
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={onOpenOptimizations}>
-          Optimizations
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={onOpenInformation}>
-          Information
-        </ButtonItem>
+        <div style={actionButtonRowStyle}>
+          <SecondaryActionButton label="RGB" onClick={onOpenRgb} />
+          <SecondaryActionButton label="Optimizations" onClick={onOpenOptimizations} />
+          <SecondaryActionButton label="Information" onClick={onOpenInformation} />
+        </div>
       </PanelSectionRow>
     </PanelSection>
   );
@@ -1106,9 +1197,9 @@ const OptimizationsView: VFC<{
           )}
           {!loading && (
             <PanelSectionRow>
-              <ButtonItem layout="below" onClick={() => void onRefresh()}>
-                Retry
-              </ButtonItem>
+              <div style={actionButtonRowStyle}>
+                <SecondaryActionButton label="Retry" onClick={() => void onRefresh()} />
+              </div>
             </PanelSectionRow>
           )}
         </PanelSection>
@@ -1120,16 +1211,16 @@ const OptimizationsView: VFC<{
             </PanelSectionRow>
           )}
           <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              disabled={
-                controlsDisabled ||
-                !data.states.some((optimization) => optimization.available && !optimization.enabled)
-              }
-              onClick={handleEnableAvailable}
-            >
-              Enable Available Optimizations
-            </ButtonItem>
+            <div style={actionButtonRowStyle}>
+              <SecondaryActionButton
+                label="Enable Available Optimizations"
+                disabled={
+                  controlsDisabled ||
+                  !data.states.some((optimization) => optimization.available && !optimization.enabled)
+                }
+                onClick={handleEnableAvailable}
+              />
+            </div>
           </PanelSectionRow>
           {data.states.map((optimization) => (
             <PanelSectionRow key={optimization.key}>
@@ -1295,9 +1386,9 @@ const RGBView: VFC<{
           )}
           {!loading && (
             <PanelSectionRow>
-              <ButtonItem layout="below" onClick={() => void onRefresh()}>
-                Retry
-              </ButtonItem>
+              <div style={actionButtonRowStyle}>
+                <SecondaryActionButton label="Retry" onClick={() => void onRefresh()} />
+              </div>
             </PanelSectionRow>
           )}
         </PanelSection>
@@ -1387,9 +1478,20 @@ const RGBView: VFC<{
                   {supportedModes.map((mode) => {
                     const active = selectedMode === mode;
                     return (
-                      <ButtonItem
+                      <NativeOptionButton
                         key={mode}
-                        layout="below"
+                        title={RGB_MODE_LABELS[mode] || mode}
+                        description={
+                          mode === "solid"
+                            ? "Static color"
+                            : mode === "pulse"
+                              ? "Native breathing effect"
+                              : mode === "spiral"
+                                ? "Native rotating effect"
+                                : "Native cycling effect"
+                        }
+                        status={active ? "Selected" : "Available"}
+                        active={active}
                         disabled={controlsDisabled}
                         onClick={() => {
                           if (mode === selectedMode) {
@@ -1398,35 +1500,7 @@ const RGBView: VFC<{
                           setSelectedMode(mode);
                           void handleRgbMode(mode);
                         }}
-                      >
-                        <div style={rgbModeButtonStyle(active)}>
-                          <div
-                            style={{
-                              color: active ? "#0f172a" : "#ffffff",
-                              fontSize: "12px",
-                              fontWeight: 800,
-                            }}
-                          >
-                            {RGB_MODE_LABELS[mode] || mode}
-                          </div>
-                          <div
-                            style={{
-                              color: active ? "rgba(15,23,42,0.82)" : "#cbd5e1",
-                              fontSize: "10px",
-                              marginTop: "4px",
-                              lineHeight: 1.35,
-                            }}
-                          >
-                            {mode === "solid"
-                              ? "Static color"
-                              : mode === "pulse"
-                                ? "Native breathing effect"
-                                : mode === "spiral"
-                                  ? "Native rotating effect"
-                                  : "Native cycling effect"}
-                          </div>
-                        </div>
-                      </ButtonItem>
+                      />
                     );
                   })}
                 </div>
@@ -1533,9 +1607,15 @@ const RGBView: VFC<{
                       (speed) => {
                         const active = selectedSpeed === speed;
                         return (
-                          <ButtonItem
+                          <NativeOptionButton
                             key={speed}
-                            layout="below"
+                            title={RGB_SPEED_LABELS[speed] || speed}
+                            description={
+                              RGB_SPEED_DESCRIPTIONS[speed] ||
+                              "Native animation speed"
+                            }
+                            status={active ? "Selected" : "Available"}
+                            active={active}
                             disabled={controlsDisabled}
                             onClick={() => {
                               if (speed === selectedSpeed) {
@@ -1544,19 +1624,7 @@ const RGBView: VFC<{
                               setSelectedSpeed(speed);
                               void handleRgbSpeed(speed);
                             }}
-                          >
-                            <div style={rgbModeButtonStyle(active)}>
-                              <div
-                                style={{
-                                  color: active ? "#0f172a" : "#ffffff",
-                                  fontSize: "12px",
-                                  fontWeight: 800,
-                                }}
-                              >
-                                {RGB_SPEED_LABELS[speed] || speed}
-                              </div>
-                            </div>
-                          </ButtonItem>
+                          />
                         );
                       }
                     )}
@@ -1654,9 +1722,9 @@ const InformationView: VFC<{
           )}
           {!loading && (
             <PanelSectionRow>
-              <ButtonItem layout="below" onClick={() => void onRefresh()}>
-                Retry
-              </ButtonItem>
+              <div style={actionButtonRowStyle}>
+                <SecondaryActionButton label="Retry" onClick={() => void onRefresh()} />
+              </div>
             </PanelSectionRow>
           )}
         </PanelSection>
@@ -1904,9 +1972,13 @@ const InformationView: VFC<{
               </div>
             </PanelSectionRow>
             <PanelSectionRow>
-              <ButtonItem layout="below" disabled={controlsDisabled} onClick={() => void onClearDebug()}>
-                Clear Debug Log
-              </ButtonItem>
+              <div style={actionButtonRowStyle}>
+                <SecondaryActionButton
+                  label="Clear Debug Log"
+                  disabled={controlsDisabled}
+                  onClick={() => void onClearDebug()}
+                />
+              </div>
             </PanelSectionRow>
             <PanelSectionRow>
               <div style={cardStyle}>

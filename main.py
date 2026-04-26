@@ -16,6 +16,86 @@ import shutil
 import importlib
 
 import decky
+from state_aggregator import StateAggregator
+from platform_support import (
+    get_device_metadata,
+    get_platform_support,
+    get_steamos_version,
+    is_steam_deck_device,
+    is_supported_handheld_vendor_device,
+    parse_version_tuple,
+    steamos_version_is_supported,
+)
+from rgb_support import (
+    LEGION_RGB_BRIGHTNESS_MAX,
+    RGB_COLOR_PRESETS,
+    RGB_DEFAULT_BRIGHTNESS,
+    RGB_DEFAULT_MODE,
+    RGB_DEFAULT_SPEED,
+    RGB_SPEED_OPTIONS,
+    asus_hid_rgb_commands,
+    clamp_int,
+    get_rgb_mode_capabilities,
+    get_rgb_supported_modes,
+    get_saved_rgb_mode,
+    hex_to_rgb,
+    legion_hid_rgb_commands,
+    normalize_rgb_brightness,
+    normalize_rgb_color,
+    normalize_rgb_speed,
+    rgb_hid_padded,
+    scale_rgb_brightness_from_raw,
+    scale_rgb_brightness_to_raw,
+)
+from optimization_support import (
+    atomic_managed_entries,
+    forget_kernel_param_state,
+    managed_kernel_params_from_state,
+    optimization_state,
+    remember_kernel_param_state,
+)
+from optimization_ops import (
+    migrate_atomic_manifest_if_needed,
+    pop_optimization_state_value,
+    read_optimization_state,
+    refresh_atomic_manifest,
+    remove_managed_file,
+    update_grub_param,
+    write_optimization_state,
+)
+from optimization_runtime import (
+    amd_npu_present,
+    grub_param_configured,
+    is_amd_platform,
+    kernel_param_active,
+    read_acpi_wakeup_entries,
+    read_acpi_wake_enabled_devices,
+    read_cmdline,
+    read_sysctl,
+    read_thp_mode,
+    service_active,
+    service_enabled,
+    service_exists,
+    set_acpi_wake_devices,
+    systemctl,
+    thp_is_madvise,
+    usb_wake_candidate_devices,
+    usb_wake_control_available,
+    write_sysctl,
+    write_thp_mode,
+)
+from performance_service import PerformanceService
+from display_service import DisplayService
+from rgb_controller import RgbController
+from system_info import (
+    default_battery_info,
+    default_device_info,
+    estimate_battery_times,
+    format_duration_hours,
+    get_battery_path,
+    populate_battery_info,
+    populate_device_info,
+)
 
 # Hardware paths. Vendor-specific paths are optional and features stay hidden
 # when the running handheld does not expose them.
@@ -36,11 +116,6 @@ RGB_LED_PATH_GLOBS = [
     "/sys/class/leds/*legion*go*",
     "/sys/class/leds/*joystick*ring*",
 ]
-
-STEAMOS_MIN_VERSION = (3, 8)
-ASUS_VENDOR_NAMES = {"ASUS", "ASUSTEK", "ASUSTEK COMPUTER INC."}
-LENOVO_VENDOR_NAMES = {"LENOVO"}
-STEAM_DECK_VENDOR_NAMES = {"VALVE"}
 
 PLUGIN_NAME = "Xbox Companion"
 
@@ -84,22 +159,7 @@ NATIVE_PERFORMANCE_PROFILES = {
 FPS_NATIVE_PRESET_VALUES = [30, 40, 60]
 FPS_HIGH_REFRESH_MIN = 90
 FPS_OPTION_DISABLED = 0
-RGB_COLOR_PRESETS = [
-    "#FF0000",
-    "#00FFFF",
-    "#8B00FF",
-    "#00FF00",
-    "#FF8000",
-    "#FF00FF",
-    "#FFFFFF",
-    "#0000FF",
-]
-RGB_DEFAULT_BRIGHTNESS = 100
-LEGION_RGB_BRIGHTNESS_MAX = 63
 LEGION_RGB_SPEED_DEFAULT = 63
-RGB_DEFAULT_MODE = "solid"
-RGB_SPEED_OPTIONS = ("low", "medium", "high")
-RGB_DEFAULT_SPEED = "medium"
 DEFAULT_COMMAND_TIMEOUT = 5
 DEBUG_LOG_LIMIT = 250
 SYSTEM_COMMAND_ENV_DROP_KEYS = {
@@ -152,6 +212,8 @@ MEMORY_SYSCTL_PATH = "/etc/sysctl.d/99-xbox-companion-memory-tuning.conf"
 THP_TMPFILES_PATH = "/etc/tmpfiles.d/xbox-companion-thp.conf"
 NPU_BLACKLIST_PATH = "/etc/modprobe.d/blacklist-xbox-companion-npu.conf"
 USB_WAKE_SERVICE_PATH = "/etc/systemd/system/xbox-companion-disable-usb-wake.service"
+USB_WAKE_SCRIPT_PATH = "/etc/xbox-companion/apply-usb-wake.sh"
+USB_WAKE_CONFIG_PATH = "/etc/xbox-companion/usb-wake-devices.conf"
 ATOMIC_MANIFEST_PATH = f"{ATOMIC_UPDATE_DIR}/xbox-companion.conf"
 OPTIMIZATION_STATE_PATH = "/var/lib/xbox-companion/optimization-state.json"
 LEGACY_ATOMIC_PATHS = [
@@ -188,18 +250,6 @@ THP_TMPFILES_CONTENT = (
 )
 
 NPU_BLACKLIST_CONTENT = "blacklist amdxdna\n"
-
-USB_WAKE_SERVICE_CONTENT = """[Unit]
-Description=Xbox Companion - Block USB Wake
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'awk "$NF == \\"enabled\\" && ($1 ~ /^XHC/ || $1 ~ /^USB/) { print $1 }" /proc/acpi/wakeup | while read -r device; do echo "$device" > /proc/acpi/wakeup; done'
-
-[Install]
-WantedBy=multi-user.target
-"""
 
 GRUB_KERNEL_PARAM_OPTIONS = {
     "kernel_amd_pstate": {
@@ -416,7 +466,10 @@ class HostRuntime:
             raise FileNotFoundError("empty command")
         info = self.resolve_command(command[0])
         if not info["available"]:
-            raise FileNotFoundError(command[0])
+            # Let subprocess surface a real FileNotFoundError at execution time.
+            # This keeps mocked subprocess.run tests working even when the local
+            # development machine does not provide host-only commands like xprop.
+            return command, info
         if info["via_host"]:
             return ["flatpak-spawn", "--host", *command], info
         return command, info
@@ -1280,30 +1333,13 @@ class Plugin:
         )
 
     def _clamp_int(self, value, minimum: int, maximum: int) -> int:
-        try:
-            numeric = int(round(float(value)))
-        except Exception:
-            numeric = minimum
-        return max(minimum, min(maximum, numeric))
+        return clamp_int(value, minimum, maximum)
 
     def _normalize_rgb_brightness(self, brightness) -> int:
-        return self._clamp_int(brightness, 0, 100)
+        return normalize_rgb_brightness(brightness)
 
     def _normalize_rgb_color(self, color: str) -> str | None:
-        if not isinstance(color, str):
-            return None
-
-        normalized = color.strip().upper()
-        if normalized.startswith("#"):
-            normalized = normalized[1:]
-
-        if len(normalized) != 6:
-            return None
-
-        if any(char not in "0123456789ABCDEF" for char in normalized):
-            return None
-
-        return f"#{normalized}"
+        return normalize_rgb_color(color)
 
     def _get_saved_rgb_brightness(self) -> int:
         return self._normalize_rgb_brightness(
@@ -1311,51 +1347,22 @@ class Plugin:
         )
 
     def _normalize_rgb_speed(self, speed: str | None) -> str:
-        if not isinstance(speed, str):
-            return RGB_DEFAULT_SPEED
-        normalized = speed.strip().lower()
-        return normalized if normalized in RGB_SPEED_OPTIONS else RGB_DEFAULT_SPEED
+        return normalize_rgb_speed(speed)
 
     def _get_rgb_supported_modes(self, backend: dict) -> list[str]:
-        if backend["type"] == "legion_hid":
-            protocol = backend.get("device", {}).get("config", {}).get("protocol")
-            if protocol in {"legion_go_s", "legion_go_tablet"}:
-                return ["solid", "pulse", "rainbow", "spiral"]
-            return ["solid", "pulse", "rainbow"]
-        if backend["type"] == "asus_hid":
-            return ["solid", "pulse", "rainbow", "spiral"]
-        if backend["type"] == "sysfs":
-            return ["solid"]
-        return []
+        return get_rgb_supported_modes(backend)
 
     def _get_rgb_mode_capabilities(self, backend: dict) -> dict[str, dict]:
-        supported_modes = self._get_rgb_supported_modes(backend)
-        capabilities = {}
-        for mode in supported_modes:
-            capabilities[mode] = {
-                "color": mode in {"solid", "pulse"},
-                "brightness": True,
-                "speed": backend["type"] in {"legion_hid", "asus_hid"} and mode in {"pulse", "rainbow", "spiral"},
-            }
-        return capabilities
+        return get_rgb_mode_capabilities(backend)
 
     def _get_saved_rgb_mode(self, backend: dict) -> str:
-        supported_modes = self._get_rgb_supported_modes(backend)
-        if not supported_modes:
-            return RGB_DEFAULT_MODE
-        mode = str(self.settings.get("rgb_mode", supported_modes[0]) or supported_modes[0]).strip().lower()
-        return mode if mode in supported_modes else supported_modes[0]
+        return get_saved_rgb_mode(self.settings, backend)
 
     def _scale_rgb_brightness_to_raw(self, brightness: int, maximum: int) -> int:
-        if maximum <= 0:
-            return 0
-        brightness = self._normalize_rgb_brightness(brightness)
-        return int(round((brightness / 100) * maximum))
+        return scale_rgb_brightness_to_raw(brightness, maximum)
 
     def _scale_rgb_brightness_from_raw(self, raw_value: int, maximum: int) -> int:
-        if maximum <= 0:
-            return RGB_DEFAULT_BRIGHTNESS
-        return self._clamp_int((raw_value / maximum) * 100, 0, 100)
+        return scale_rgb_brightness_from_raw(raw_value, maximum)
 
     def _get_led_max_brightness(self, led_path: str) -> int:
         max_brightness_path = os.path.join(led_path, "max_brightness")
@@ -1368,68 +1375,60 @@ class Plugin:
         return 255
 
     def _get_battery_path(self) -> str:
-        direct_paths = [BATTERY_PATH]
-        for path in direct_paths:
-            if os.path.exists(path):
-                return path
-
-        candidates = []
-        for pattern in BATTERY_PATH_GLOBS:
-            candidates.extend(sorted(glob.glob(pattern)))
-
-        for path in candidates:
-            type_path = os.path.join(path, "type")
-            if self._read_file(type_path, "").lower() == "battery":
-                return path
-
-        return candidates[0] if candidates else ""
+        return get_battery_path(self._read_file, BATTERY_PATH, list(BATTERY_PATH_GLOBS))
 
     def _format_duration_hours(self, hours: float) -> str:
-        if not math.isfinite(hours) or hours <= 0:
-            return "Unknown"
-
-        total_minutes = max(1, int(round(hours * 60)))
-        whole_hours, minutes = divmod(total_minutes, 60)
-        if whole_hours == 0:
-            return f"{minutes}m"
-        if minutes == 0:
-            return f"{whole_hours}h"
-        return f"{whole_hours}h {minutes}m"
+        return format_duration_hours(hours)
 
     def _estimate_battery_times(self, battery: dict) -> tuple[str, str]:
-        voltage = float(battery.get("voltage", 0) or 0)
-        current = abs(float(battery.get("current", 0) or 0))
-        capacity = float(battery.get("capacity", 0) or 0)
-        full_capacity = float(
-            battery.get("full_capacity", 0)
-            or battery.get("design_capacity", 0)
-            or 0
-        )
+        return estimate_battery_times(battery, STEAMOS_CHARGE_FULL_PERCENT)
 
-        if voltage <= 0 or current <= 0 or capacity <= 0 or full_capacity <= 0:
-            return "Unknown", "Unknown"
+    def _read_text_file_if_exists(self, path: str) -> str:
+        try:
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    return f.read().strip()
+        except Exception:
+            pass
+        return ""
 
-        power = voltage * current
-        if power <= 0:
-            return "Unknown", "Unknown"
+    def _read_cpu_model(self) -> str:
+        try:
+            if os.path.exists("/proc/cpuinfo"):
+                with open("/proc/cpuinfo", "r") as f:
+                    for line in f:
+                        if line.startswith("model name"):
+                            return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        return ""
 
-        stored_energy = full_capacity * min(capacity, 100) / 100
-        target_percent = min(
-            max(float(battery.get("charge_limit", STEAMOS_CHARGE_FULL_PERCENT) or 0), 0),
-            100,
-        )
-        target_energy = full_capacity * target_percent / 100
-        status = str(battery.get("status", "") or "").strip().lower()
+    def _read_kernel_version(self) -> str:
+        try:
+            result = subprocess.run(
+                ["uname", "-r"],
+                capture_output=True,
+                text=True,
+                timeout=DEFAULT_COMMAND_TIMEOUT,
+                env=sanitized_system_env(),
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return ""
 
-        time_to_empty = "Unknown"
-        time_to_full = "Unknown"
-
-        if status == "discharging" and stored_energy > 0:
-            time_to_empty = self._format_duration_hours(stored_energy / power)
-        elif status == "charging" and target_energy > stored_energy:
-            time_to_full = self._format_duration_hours((target_energy - stored_energy) / power)
-
-        return time_to_empty, time_to_full
+    def _read_memory_total_gb(self) -> str:
+        try:
+            if os.path.exists("/proc/meminfo"):
+                with open("/proc/meminfo", "r") as f:
+                    for line in f:
+                        if line.startswith("MemTotal"):
+                            mem_kb = int(line.split()[1])
+                            return f"{mem_kb // 1024 // 1024} GB"
+        except Exception:
+            pass
+        return ""
 
     def _get_os_release_values(self) -> dict:
         try:
@@ -1448,12 +1447,7 @@ class Plugin:
 
     def _get_steamos_version(self, os_release_values: dict | None = None) -> str:
         values = os_release_values if os_release_values is not None else self._get_os_release_values()
-        return (
-            values.get("PRETTY_NAME")
-            or values.get("VERSION")
-            or values.get("NAME")
-            or "Unknown"
-        )
+        return get_steamos_version(values)
 
     def _is_steam_deck_device(
         self,
@@ -1462,15 +1456,11 @@ class Plugin:
         sys_vendor: str,
         product_family: str,
     ) -> bool:
-        normalized_vendor = sys_vendor.strip().upper()
-        identifiers = " ".join(
-            value.strip().upper()
-            for value in (board_name, product_name, product_family)
-            if value and value != "Unknown"
-        )
-        return normalized_vendor in STEAM_DECK_VENDOR_NAMES or any(
-            keyword in identifiers
-            for keyword in ("STEAM DECK", "JUPITER", "GALILEO")
+        return is_steam_deck_device(
+            board_name,
+            product_name,
+            sys_vendor,
+            product_family,
         )
 
     def _is_supported_handheld_vendor_device(
@@ -1480,46 +1470,18 @@ class Plugin:
         sys_vendor: str,
         product_family: str,
     ) -> bool:
-        normalized_vendor = sys_vendor.strip().upper()
-        identifiers = " ".join(
-            value.strip().upper()
-            for value in (board_name, product_name, product_family)
-            if value and value != "Unknown"
+        return is_supported_handheld_vendor_device(
+            board_name,
+            product_name,
+            sys_vendor,
+            product_family,
         )
 
-        if normalized_vendor in ASUS_VENDOR_NAMES:
-            return any(keyword in identifiers for keyword in ("ALLY", "ROG", "XBOX", "RC7"))
-
-        if normalized_vendor in LENOVO_VENDOR_NAMES:
-            return "LEGION" in identifiers
-
-        return False
-
     def _parse_version_tuple(self, raw_version: str) -> tuple[int, int] | None:
-        parts = []
-        current = ""
-        for char in raw_version:
-            if char.isdigit():
-                current += char
-            elif current:
-                parts.append(int(current))
-                current = ""
-                if len(parts) == 2:
-                    break
-        if current and len(parts) < 2:
-            parts.append(int(current))
-        if not parts:
-            return None
-        if len(parts) == 1:
-            parts.append(0)
-        return parts[0], parts[1]
+        return parse_version_tuple(raw_version)
 
     def _steamos_version_is_supported(self, values: dict) -> bool:
-        for key in ("VERSION_ID", "VERSION", "PRETTY_NAME"):
-            parsed = self._parse_version_tuple(values.get(key, ""))
-            if parsed is not None:
-                return parsed >= STEAMOS_MIN_VERSION
-        return False
+        return steamos_version_is_supported(values)
 
     def _get_platform_support(
         self,
@@ -1530,50 +1492,13 @@ class Plugin:
         os_release_values: dict | None = None,
     ) -> dict:
         values = os_release_values if os_release_values is not None else self._get_os_release_values()
-        os_id = values.get("ID", "").strip().lower()
-        os_name = " ".join(
-            values.get(key, "")
-            for key in ("NAME", "PRETTY_NAME", "ID", "ID_LIKE")
-        ).lower()
-
-        if self._is_steam_deck_device(board_name, product_name, sys_vendor, product_family):
-            return {
-                "supported": False,
-                "support_level": "blocked",
-                "reason": "Steam Deck is blocked to avoid interfering with Valve hardware defaults.",
-            }
-
-        if os_id != "steamos" or any(name in os_name for name in ("bazzite", "chimeraos", "chimera")):
-            return {
-                "supported": False,
-                "support_level": "blocked",
-                "reason": "Xbox Companion is only enabled on SteamOS 3.8 or newer.",
-            }
-
-        if not self._steamos_version_is_supported(values):
-            return {
-                "supported": False,
-                "support_level": "blocked",
-                "reason": "Xbox Companion requires SteamOS 3.8 or newer.",
-            }
-
-        if not self._is_supported_handheld_vendor_device(
+        return get_platform_support(
             board_name,
             product_name,
             sys_vendor,
             product_family,
-        ):
-            return {
-                "supported": False,
-                "support_level": "blocked",
-                "reason": "Xbox Companion is only enabled on ASUS and Lenovo handhelds.",
-            }
-
-        return {
-            "supported": True,
-            "support_level": "supported",
-            "reason": "Supported ASUS/Lenovo handheld on SteamOS 3.8 or newer.",
-        }
+            values,
+        )
 
     def _get_device_metadata(
         self,
@@ -1582,23 +1507,7 @@ class Plugin:
         sys_vendor: str = "",
         product_family: str = "",
     ) -> dict:
-        vendor = (
-            sys_vendor
-            if sys_vendor and sys_vendor != "Unknown"
-            else "Unknown"
-        )
-        friendly_name = product_name if product_name and product_name != "Unknown" else "SteamOS handheld"
-
-        return {
-            "board_name": board_name,
-            "product_name": product_name,
-            "product_family": product_family or "Unknown",
-            "sys_vendor": vendor,
-            "variant": board_name or product_name or "Unknown",
-            "friendly_name": friendly_name,
-            "device_family": "steamos_handheld",
-            "support_level": "supported",
-        }
+        return get_device_metadata(board_name, product_name, sys_vendor, product_family)
 
     def _get_current_platform_support(self) -> dict:
         board_name = self._read_file(os.path.join(DMI_PATH, "board_name"))
@@ -1612,177 +1521,63 @@ class Plugin:
             product_family,
         )
 
-    async def get_device_info(self) -> dict:
-        info = {
-            "model": "Unknown",
-            "friendly_name": "Unknown",
-            "board_name": "Unknown",
-            "product_name": "Unknown",
-            "sys_vendor": "Unknown",
-            "variant": "Unknown",
-            "device_family": "unknown",
-            "support_level": "unsupported",
-            "steamos_version": "Unknown",
-            "bios_version": "Unknown",
-            "serial": "Unknown",
-            "cpu": "Unknown",
-            "gpu": "Unknown",
-            "kernel": "Unknown",
-            "memory_total": "Unknown",
-            "platform_supported": False,
-            "platform_support_reason": "Platform support has not been checked",
+    def _unsupported_platform_state(self, defaults: dict, support: dict | None = None) -> dict:
+        current_support = support if support is not None else self._get_current_platform_support()
+        reason = current_support.get("reason", "Platform is not supported")
+        return {
+            **defaults,
+            "status": reason,
+            "details": reason,
         }
-        
+
+    def _guard_supported_action(self, area: str, action: str, details: dict | None = None) -> tuple[bool, dict]:
+        support = self._get_current_platform_support()
+        if support.get("supported", False):
+            return True, support
+        reason = support.get("reason", "Platform is not supported")
+        decky.logger.warning(reason)
+        self._debug_failure(area, action, reason, details)
+        return False, support
+
+    async def get_device_info(self) -> dict:
+        info = default_device_info()
+
         try:
             os_release_values = self._get_os_release_values()
-
-            # Read DMI info
-            dmi_files = {
-                "model": "product_name",
-                "product_name": "product_name",
-                "product_family": "product_family",
-                "sys_vendor": "sys_vendor",
-                "board_name": "board_name",
-                "bios_version": "bios_version",
-                "serial": "product_serial"
-            }
-            
-            for key, filename in dmi_files.items():
-                filepath = os.path.join(DMI_PATH, filename)
-                if os.path.exists(filepath):
-                    with open(filepath, 'r') as f:
-                        info[key] = f.read().strip()
-
-            device_metadata = self._get_device_metadata(
-                board_name=info.get("board_name", "Unknown"),
-                product_name=info.get("model", "Unknown"),
-                sys_vendor=info.get("sys_vendor", "Unknown"),
-                product_family=info.get("product_family", "Unknown"),
-            )
-            platform_support = self._get_platform_support(
-                board_name=info.get("board_name", "Unknown"),
-                product_name=info.get("model", "Unknown"),
-                sys_vendor=info.get("sys_vendor", "Unknown"),
-                product_family=info.get("product_family", "Unknown"),
+            info = populate_device_info(
+                info,
+                dmi_path=DMI_PATH,
                 os_release_values=os_release_values,
+                read_text_file=self._read_text_file_if_exists,
+                read_cpu_model=self._read_cpu_model,
+                read_kernel_version=self._read_kernel_version,
+                read_memory_total_gb=self._read_memory_total_gb,
+                get_device_metadata_fn=self._get_device_metadata,
+                get_platform_support_fn=self._get_platform_support,
+                get_steamos_version_fn=self._get_steamos_version,
             )
-            info.update(device_metadata)
-            info.update(platform_support)
-            info["platform_supported"] = platform_support.get("supported", False)
-            info["platform_support_reason"] = platform_support.get("reason", "")
-            info["steamos_version"] = self._get_steamos_version(os_release_values)
-            
-            # Get CPU info
-            if os.path.exists("/proc/cpuinfo"):
-                with open("/proc/cpuinfo", 'r') as f:
-                    for line in f:
-                        if line.startswith("model name"):
-                            info["cpu"] = line.split(":")[1].strip()
-                            break
-            
-            # Get kernel version
-            result = subprocess.run(
-                ["uname", "-r"],
-                capture_output=True,
-                text=True,
-                timeout=DEFAULT_COMMAND_TIMEOUT,
-                env=sanitized_system_env(),
-            )
-            if result.returncode == 0:
-                info["kernel"] = result.stdout.strip()
-            
-            # Get memory info
-            if os.path.exists("/proc/meminfo"):
-                with open("/proc/meminfo", 'r') as f:
-                    for line in f:
-                        if line.startswith("MemTotal"):
-                            mem_kb = int(line.split()[1])
-                            info["memory_total"] = f"{mem_kb // 1024 // 1024} GB"
-                            break
-            
-            # GPU info (AMD APU)
-            info["gpu"] = "AMD Radeon 780M" if "Z1" in info.get("cpu", "") else "AMD Radeon Graphics"
-            
         except Exception as e:
             decky.logger.error(f"Failed to get device info: {e}")
-        
+
         return info
 
     async def get_battery_info(self) -> dict:
-        battery = {
-            "present": False,
-            "status": "Unknown",
-            "capacity": 0,
-            "health": 100,
-            "cycle_count": 0,
-            "voltage": 0,
-            "current": 0,
-            "temperature": 0,
-            "design_capacity": 0,
-            "full_capacity": 0,
-            "charge_limit": STEAMOS_CHARGE_FULL_PERCENT,
-            "time_to_empty": "Unknown",
-            "time_to_full": "Unknown"
-        }
-        
+        battery = default_battery_info(STEAMOS_CHARGE_FULL_PERCENT)
+
         try:
             battery_path = self._get_battery_path()
-            if not battery_path:
-                return battery
-            
-            battery["present"] = True
-            
-            # Read battery files
-            battery_files = {
-                "status": "status",
-                "capacity": "capacity",
-                "cycle_count": "cycle_count",
-                "voltage_now": "voltage_now",
-                "current_now": "current_now",
-                "energy_full_design": "energy_full_design",
-                "energy_full": "energy_full"
-            }
-            
-            for key, filename in battery_files.items():
-                filepath = os.path.join(battery_path, filename)
-                if os.path.exists(filepath):
-                    with open(filepath, 'r') as f:
-                        value = f.read().strip()
-                        if key == "status":
-                            battery["status"] = value
-                        elif key == "capacity":
-                            battery["capacity"] = int(value)
-                        elif key == "cycle_count":
-                            battery["cycle_count"] = int(value)
-                        elif key == "voltage_now":
-                            battery["voltage"] = int(value) / 1000000  # Convert to V
-                        elif key == "current_now":
-                            battery["current"] = int(value) / 1000000  # Convert to A
-                        elif key == "energy_full_design":
-                            battery["design_capacity"] = int(value) / 1000000  # Convert to Wh
-                        elif key == "energy_full":
-                            battery["full_capacity"] = int(value) / 1000000  # Convert to Wh
-            
-            # Calculate health percentage
-            if battery["design_capacity"] > 0:
-                battery["health"] = round((battery["full_capacity"] / battery["design_capacity"]) * 100, 1)
-            
-            # Try to get temperature from ACPI
-            temp_path = os.path.join(battery_path, "temp")
-            if os.path.exists(temp_path):
-                with open(temp_path, 'r') as f:
-                    battery["temperature"] = int(f.read().strip()) / 10  # Convert to Celsius
-
+            battery = populate_battery_info(
+                battery,
+                battery_path=battery_path,
+                charge_full_percent=STEAMOS_CHARGE_FULL_PERCENT,
+                read_text_file=self._read_text_file_if_exists,
+            )
             charge_limit_state = await self.get_charge_limit_state()
             battery["charge_limit"] = charge_limit_state.get("limit", battery["charge_limit"])
-            (
-                battery["time_to_empty"],
-                battery["time_to_full"],
-            ) = self._estimate_battery_times(battery)
-            
+            battery["time_to_empty"], battery["time_to_full"] = self._estimate_battery_times(battery)
         except Exception as e:
             decky.logger.error(f"Failed to get battery info: {e}")
-        
+
         return battery
 
     def _set_led_color(self, led_path: str, color: str, enabled: bool, brightness: int | None = None) -> bool:
@@ -1909,6 +1704,83 @@ class Plugin:
 
         return enabled, color, brightness
 
+    def _get_rgb_controller(self) -> RgbController:
+        return RgbController(
+            logger=decky.logger,
+            get_settings=lambda: self.settings,
+            get_platform_support=self._get_current_platform_support,
+            get_rgb_backend=self._get_rgb_backend,
+            get_rgb_supported_modes=self._get_rgb_supported_modes,
+            get_rgb_mode_capabilities=self._get_rgb_mode_capabilities,
+            read_rgb_state_from_led=self._read_rgb_state_from_led,
+            get_saved_rgb_mode=self._get_saved_rgb_mode,
+            normalize_rgb_speed=self._normalize_rgb_speed,
+            normalize_rgb_color=self._normalize_rgb_color,
+            get_saved_rgb_brightness=self._get_saved_rgb_brightness,
+            normalize_rgb_brightness=self._normalize_rgb_brightness,
+            set_led_color=self._set_led_color,
+            write_hid_rgb=self._write_hid_rgb,
+            save_settings=self._save_settings,
+            debug_attempt=self._debug_attempt,
+            debug_success=self._debug_success,
+            debug_failure=self._debug_failure,
+        )
+
+    def _get_steamos_manager(self) -> SteamOsManagerClient:
+        if self.steamos_manager is None:
+            self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
+        return self.steamos_manager
+
+    def _get_gamescope_settings(self) -> GamescopeSettingsClient:
+        if self.gamescope_settings is None:
+            self.gamescope_settings = GamescopeSettingsClient(decky.logger, self.runtime)
+        return self.gamescope_settings
+
+    def _get_performance_service(self) -> PerformanceService:
+        return PerformanceService(
+            logger=decky.logger,
+            native_profiles=NATIVE_PERFORMANCE_PROFILES,
+            get_platform_support=self._get_current_platform_support,
+            get_steamos_manager=self._get_steamos_manager,
+            get_profiles_callback=self.get_performance_profiles,
+            debug_attempt=self._debug_attempt,
+            debug_success=self._debug_success,
+            debug_failure=self._debug_failure,
+        )
+
+    def _get_display_service(self) -> DisplayService:
+        return DisplayService(
+            logger=decky.logger,
+            get_platform_support=self._get_current_platform_support,
+            get_gamescope_settings=self._get_gamescope_settings,
+            command_info=self._command_info,
+            command_exists=self._command_exists,
+            run_command=self._run_command_output,
+            get_fps_presets=self._get_fps_presets,
+            debug_attempt=self._debug_attempt,
+            debug_success=self._debug_success,
+            debug_failure=self._debug_failure,
+        )
+
+    def _get_state_aggregator(self) -> StateAggregator:
+        return StateAggregator(
+            get_performance_modes=self.get_performance_modes,
+            get_cpu_settings=self.get_cpu_settings,
+            get_rgb_state=self.get_rgb_state,
+            get_display_sync_state=self.get_display_sync_state,
+            get_fps_limit_state=self.get_fps_limit_state,
+            get_charge_limit_state=self.get_charge_limit_state,
+            get_device_info=self.get_device_info,
+            get_battery_info=self.get_battery_info,
+            get_performance_profiles=self.get_performance_profiles,
+            get_current_tdp=self.get_current_tdp,
+            get_optimization_states=self.get_optimization_states,
+            get_runtime_state=self._get_runtime_state,
+            get_runtime_backend=self.runtime.execution_backend,
+            get_debug_log_snapshot=lambda: list(self.debug_log),
+            debug_event=self._debug_event,
+        )
+
     def _legion_go_s_rgb_commands(
         self,
         color: str,
@@ -1917,40 +1789,14 @@ class Plugin:
         mode: str = RGB_DEFAULT_MODE,
         speed: str = RGB_DEFAULT_SPEED,
     ) -> list[bytes]:
-        if not enabled:
-            return [bytes([0x04, 0x06, 0x00])]
-
-        r, g, b = self._hex_to_rgb(color)
-        profile = 3
-        mode_map = {
-            "solid": 0,
-            "pulse": 1,
-            "rainbow": 2,
-            "spiral": 3,
-        }
-        speed_map = {
-            "low": 21,
-            "medium": 42,
-            "high": 63,
-        }
-        raw_brightness = self._scale_rgb_brightness_to_raw(
+        return legion_hid_rgb_commands(
+            {"config": {"protocol": "legion_go_s"}},
+            color,
+            enabled,
             brightness,
-            LEGION_RGB_BRIGHTNESS_MAX,
+            mode,
+            speed,
         )
-        return [
-            bytes([0x04, 0x06, 0x01]),
-            bytes([0x10, 0x02, profile]),
-            bytes([
-                0x10,
-                profile + 2,
-                mode_map.get(mode, 0),
-                r,
-                g,
-                b,
-                raw_brightness,
-                speed_map.get(speed, speed_map[RGB_DEFAULT_SPEED]),
-            ]),
-        ]
 
     def _legion_go_tablet_rgb_commands(
         self,
@@ -1960,58 +1806,20 @@ class Plugin:
         mode: str = RGB_DEFAULT_MODE,
         speed: str = RGB_DEFAULT_SPEED,
     ) -> list[bytes]:
-        def enable_command(controller: int, value: bool) -> bytes:
-            return bytes([0x05, 0x06, 0x70, 0x02, controller, 0x01 if value else 0x00, 0x01])
-
-        if not enabled:
-            return [enable_command(0x03, False), enable_command(0x04, False)]
-
-        r, g, b = self._hex_to_rgb(color)
-        profile = 3
-        mode_map = {
-            "solid": 1,
-            "pulse": 2,
-            "rainbow": 3,
-            "spiral": 4,
-        }
-        speed_map = {
-            "low": 42,
-            "medium": 21,
-            "high": 0,
-        }
-        raw_brightness = self._scale_rgb_brightness_to_raw(
+        return legion_hid_rgb_commands(
+            {"config": {"protocol": "legion_go_tablet"}},
+            color,
+            enabled,
             brightness,
-            LEGION_RGB_BRIGHTNESS_MAX,
+            mode,
+            speed,
         )
-        period = speed_map.get(speed, speed_map[RGB_DEFAULT_SPEED])
-        commands = []
-        for controller in (0x03, 0x04):
-            commands.append(bytes([
-                0x05,
-                0x0C,
-                0x72,
-                0x01,
-                controller,
-                mode_map.get(mode, 1),
-                r,
-                g,
-                b,
-                raw_brightness,
-                period,
-                profile,
-                0x01,
-            ]))
-        for controller in (0x03, 0x04):
-            commands.append(bytes([0x05, 0x06, 0x73, 0x02, controller, profile, 0x01]))
-        commands.extend([enable_command(0x03, True), enable_command(0x04, True)])
-        return commands
 
     def _hex_to_rgb(self, color: str) -> tuple[int, int, int]:
-        rgb = color.lstrip("#")
-        return int(rgb[0:2], 16), int(rgb[2:4], 16), int(rgb[4:6], 16)
+        return hex_to_rgb(color)
 
     def _rgb_hid_padded(self, payload: list[int]) -> bytes:
-        return bytes(payload) + bytes(max(0, 64 - len(payload)))
+        return rgb_hid_padded(payload)
 
     def _asus_rgb_brightness_level(self, brightness: int) -> int:
         normalized = self._normalize_rgb_brightness(brightness)
@@ -2024,12 +1832,8 @@ class Plugin:
         return 0x03
 
     def _asus_rgb_config_command(self, boot: bool = False, charging: bool = False) -> bytes:
-        value = 0x02
-        if boot:
-            value += 0x09
-        if charging:
-            value += 0x04
-        return self._rgb_hid_padded([0x5A, 0xD1, 0x09, 0x01, value])
+        payload = [0x5A, 0xD1, 0x09, 0x01, 0x02 + (0x09 if boot else 0) + (0x04 if charging else 0)]
+        return bytes(payload) + bytes(max(0, 64 - len(payload)))
 
     def _disable_asus_dynamic_lighting(self, device: dict) -> None:
         if device.get("product_id") != 0x1B4C:
@@ -2063,33 +1867,7 @@ class Plugin:
         mode: str = RGB_DEFAULT_MODE,
         speed: str = RGB_DEFAULT_SPEED,
     ) -> list[bytes]:
-        if not enabled:
-            return [self._rgb_hid_padded([0x5A, 0xBA, 0xC5, 0xC4, 0x00])]
-
-        r, g, b = self._hex_to_rgb(color)
-        mode_map = {
-            "solid": 0x00,
-            "pulse": 0x01,
-            "rainbow": 0x02,
-            "spiral": 0x03,
-        }
-        speed_map = {
-            "low": 0xE1,
-            "medium": 0xEB,
-            "high": 0xF5,
-        }
-        mode_value = mode_map.get(mode, 0x00)
-        speed_value = 0x00 if mode == "solid" else speed_map.get(speed, speed_map[RGB_DEFAULT_SPEED])
-        if mode == "spiral":
-            r, g, b = 0, 0, 0
-        payload = [0x5A, 0xB3, 0x00, mode_value, r, g, b, speed_value, 0x00, 0x00, 0x00, 0x00, 0x00]
-        return [
-            self._asus_rgb_config_command(),
-            self._rgb_hid_padded([0x5A, 0xBA, 0xC5, 0xC4, self._asus_rgb_brightness_level(brightness)]),
-            self._rgb_hid_padded(payload),
-            self._rgb_hid_padded([0x5A, 0xB5]),
-            self._rgb_hid_padded([0x5A, 0xB4]),
-        ]
+        return asus_hid_rgb_commands(color, enabled, brightness, mode, speed)
 
     def _legion_hid_rgb_commands(
         self,
@@ -2100,14 +1878,7 @@ class Plugin:
         mode: str = RGB_DEFAULT_MODE,
         speed: str = RGB_DEFAULT_SPEED,
     ) -> list[bytes]:
-        protocol = device["config"]["protocol"]
-        if protocol == "legion_go_s":
-            return self._legion_go_s_rgb_commands(color, enabled, brightness, mode, speed)
-        if protocol == "legion_go_tablet":
-            return self._legion_go_tablet_rgb_commands(color, enabled, brightness, mode, speed)
-        if protocol == "asus_ally":
-            return self._asus_hid_rgb_commands(color, enabled, brightness, mode, speed)
-        return []
+        return legion_hid_rgb_commands(device, color, enabled, brightness, mode, speed)
 
     def _open_hid_module_device(self, path):
         module = self._hid_module()
@@ -2179,306 +1950,22 @@ class Plugin:
             return False
 
     async def get_rgb_state(self) -> dict:
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            return {
-                "available": False,
-                "enabled": False,
-                "mode": "solid",
-                "color": RGB_COLOR_PRESETS[0],
-                "brightness": RGB_DEFAULT_BRIGHTNESS,
-                "speed": RGB_DEFAULT_SPEED,
-                "brightness_available": False,
-                "supports_free_color": False,
-                "speed_available": False,
-                "capabilities": {
-                    "toggle": False,
-                    "color": False,
-                    "brightness": False,
-                },
-                "supported_modes": [],
-                "mode_capabilities": {},
-                "speed_options": list(RGB_SPEED_OPTIONS),
-                "presets": RGB_COLOR_PRESETS,
-                "details": support.get("reason", "Platform is not supported"),
-            }
-
-        backend = self._get_rgb_backend()
-        supported_modes = self._get_rgb_supported_modes(backend)
-        mode_capabilities = self._get_rgb_mode_capabilities(backend)
-        if backend["type"] == "sysfs":
-            enabled, color, brightness = self._read_rgb_state_from_led(backend["path"])
-            mode = self._get_saved_rgb_mode(backend)
-            speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
-        elif backend["type"] in {"legion_hid", "asus_hid"}:
-            enabled = bool(self.settings.get("rgb_enabled", False))
-            color = self._normalize_rgb_color(
-                self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
-            ) or RGB_COLOR_PRESETS[0]
-            brightness = self._get_saved_rgb_brightness()
-            mode = self._get_saved_rgb_mode(backend)
-            speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
-        else:
-            enabled, color, brightness = False, RGB_COLOR_PRESETS[0], RGB_DEFAULT_BRIGHTNESS
-            mode = RGB_DEFAULT_MODE
-            speed = RGB_DEFAULT_SPEED
-
-        return {
-            "available": backend["type"] != "none",
-            "enabled": enabled,
-            "mode": mode,
-            "color": color,
-            "brightness": brightness,
-            "speed": speed,
-            "brightness_available": backend["type"] != "none",
-            "supports_free_color": backend["type"] != "none",
-            "speed_available": bool(mode_capabilities.get(mode, {}).get("speed", False)),
-            "capabilities": {
-                "toggle": backend["type"] != "none",
-                "color": bool(mode_capabilities.get(mode, {}).get("color", backend["type"] != "none")),
-                "brightness": backend["type"] != "none",
-            },
-            "supported_modes": supported_modes,
-            "mode_capabilities": mode_capabilities,
-            "speed_options": list(RGB_SPEED_OPTIONS),
-            "presets": RGB_COLOR_PRESETS,
-            "details": backend["details"],
-        }
+        return await self._get_rgb_controller().get_state()
 
     async def set_rgb_enabled(self, enabled: bool) -> bool:
-        self._debug_attempt("rgb", "set_enabled", "Changing RGB enabled state", {"enabled": enabled})
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            decky.logger.warning(support.get("reason", "Platform is not supported"))
-            self._debug_failure("rgb", "set_enabled", support.get("reason", "Platform is not supported"))
-            return False
-
-        backend = self._get_rgb_backend()
-        if backend["type"] == "none":
-            decky.logger.warning("RGB control not available")
-            self._debug_failure("rgb", "set_enabled", "RGB control not available")
-            return False
-
-        if backend["type"] == "sysfs":
-            _current_enabled, current_color, current_brightness = self._read_rgb_state_from_led(backend["path"])
-            success = self._set_led_color(
-                backend["path"],
-                current_color,
-                enabled,
-                current_brightness,
-            )
-        else:
-            current_color = self._normalize_rgb_color(
-                self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
-            ) or RGB_COLOR_PRESETS[0]
-            current_brightness = self._get_saved_rgb_brightness()
-            current_mode = self._get_saved_rgb_mode(backend)
-            current_speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
-            success = self._write_hid_rgb(
-                backend,
-                current_color,
-                enabled,
-                current_brightness,
-                current_mode,
-                current_speed,
-            )
-
-        if not success:
-            self._debug_failure("rgb", "set_enabled", "Failed to write RGB state", {"backend": backend["type"]})
-            return False
-
-        self.settings["rgb_enabled"] = enabled
-        self.settings["rgb_color"] = current_color
-        self.settings["rgb_brightness"] = current_brightness
-        self._save_settings()
-        self._debug_success("rgb", "set_enabled", f"RGB {'enabled' if enabled else 'disabled'}", {"backend": backend["type"], "color": current_color, "brightness": current_brightness})
-        return True
+        return await self._get_rgb_controller().set_enabled(enabled)
 
     async def set_rgb_color(self, color: str) -> bool:
-        self._debug_attempt("rgb", "set_color", "Changing RGB color", {"color": color})
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            decky.logger.warning(support.get("reason", "Platform is not supported"))
-            self._debug_failure("rgb", "set_color", support.get("reason", "Platform is not supported"))
-            return False
-
-        backend = self._get_rgb_backend()
-        if backend["type"] == "none":
-            decky.logger.warning("RGB control not available")
-            self._debug_failure("rgb", "set_color", "RGB control not available")
-            return False
-
-        normalized = self._normalize_rgb_color(color)
-        if normalized is None:
-            decky.logger.warning(f"Unsupported RGB color value: {color}")
-            self._debug_failure("rgb", "set_color", "Unsupported RGB color value", {"color": color})
-            return False
-
-        if backend["type"] == "sysfs":
-            enabled, _current_color, brightness = self._read_rgb_state_from_led(backend["path"])
-            success = self._set_led_color(backend["path"], normalized, enabled, brightness)
-        else:
-            enabled = bool(self.settings.get("rgb_enabled", False))
-            brightness = self._get_saved_rgb_brightness()
-            mode = self._get_saved_rgb_mode(backend)
-            speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
-            success = self._write_hid_rgb(
-                backend,
-                normalized,
-                enabled,
-                brightness,
-                mode,
-                speed,
-            )
-
-        if not success:
-            self._debug_failure("rgb", "set_color", "Failed to apply RGB color", {"backend": backend["type"], "color": normalized})
-            return False
-
-        self.settings["rgb_color"] = normalized
-        self.settings["rgb_brightness"] = brightness
-        self._save_settings()
-        self._debug_success("rgb", "set_color", "RGB color applied", {"backend": backend["type"], "color": normalized, "brightness": brightness})
-        return True
+        return await self._get_rgb_controller().set_color(color)
 
     async def set_rgb_brightness(self, brightness: int) -> bool:
-        self._debug_attempt("rgb", "set_brightness", "Changing RGB brightness", {"brightness": brightness})
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            decky.logger.warning(support.get("reason", "Platform is not supported"))
-            self._debug_failure("rgb", "set_brightness", support.get("reason", "Platform is not supported"))
-            return False
-
-        backend = self._get_rgb_backend()
-        if backend["type"] == "none":
-            decky.logger.warning("RGB control not available")
-            self._debug_failure("rgb", "set_brightness", "RGB control not available")
-            return False
-
-        normalized_brightness = self._normalize_rgb_brightness(brightness)
-
-        if backend["type"] == "sysfs":
-            enabled, current_color, _current_brightness = self._read_rgb_state_from_led(backend["path"])
-            success = True
-            if enabled:
-                success = self._set_led_color(
-                    backend["path"],
-                    current_color,
-                    enabled,
-                    normalized_brightness,
-                )
-        else:
-            enabled = bool(self.settings.get("rgb_enabled", False))
-            current_color = self._normalize_rgb_color(
-                self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
-            ) or RGB_COLOR_PRESETS[0]
-            mode = self._get_saved_rgb_mode(backend)
-            speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
-            success = True
-            if enabled:
-                success = self._write_hid_rgb(
-                    backend,
-                    current_color,
-                    enabled,
-                    normalized_brightness,
-                    mode,
-                    speed,
-                )
-
-        if not success:
-            self._debug_failure("rgb", "set_brightness", "Failed to apply RGB brightness", {"backend": backend["type"], "brightness": normalized_brightness})
-            return False
-
-        self.settings["rgb_brightness"] = normalized_brightness
-        self._save_settings()
-        self._debug_success("rgb", "set_brightness", "RGB brightness applied", {"backend": backend["type"], "brightness": normalized_brightness})
-        return True
+        return await self._get_rgb_controller().set_brightness(brightness)
 
     async def set_rgb_mode(self, mode: str) -> bool:
-        self._debug_attempt("rgb", "set_mode", "Changing RGB mode", {"mode": mode})
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            decky.logger.warning(support.get("reason", "Platform is not supported"))
-            self._debug_failure("rgb", "set_mode", support.get("reason", "Platform is not supported"))
-            return False
-
-        backend = self._get_rgb_backend()
-        supported_modes = self._get_rgb_supported_modes(backend)
-        normalized_mode = str(mode or "").strip().lower()
-        if normalized_mode not in supported_modes:
-            decky.logger.warning(f"Unsupported RGB mode: {mode}")
-            self._debug_failure("rgb", "set_mode", "Unsupported RGB mode", {"mode": mode, "supported_modes": supported_modes})
-            return False
-
-        enabled = bool(self.settings.get("rgb_enabled", False))
-        current_color = self._normalize_rgb_color(
-            self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
-        ) or RGB_COLOR_PRESETS[0]
-        current_brightness = self._get_saved_rgb_brightness()
-        current_speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
-
-        success = True
-        if backend["type"] in {"legion_hid", "asus_hid"} and enabled:
-            success = self._write_hid_rgb(
-                backend,
-                current_color,
-                enabled,
-                current_brightness,
-                normalized_mode,
-                current_speed,
-            )
-
-        if not success:
-            self._debug_failure("rgb", "set_mode", "Failed to apply RGB mode", {"backend": backend["type"], "mode": normalized_mode})
-            return False
-
-        self.settings["rgb_mode"] = normalized_mode
-        self._save_settings()
-        self._debug_success("rgb", "set_mode", "RGB mode applied", {"backend": backend["type"], "mode": normalized_mode})
-        return True
+        return await self._get_rgb_controller().set_mode(mode)
 
     async def set_rgb_speed(self, speed: str) -> bool:
-        self._debug_attempt("rgb", "set_speed", "Changing RGB speed", {"speed": speed})
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            decky.logger.warning(support.get("reason", "Platform is not supported"))
-            self._debug_failure("rgb", "set_speed", support.get("reason", "Platform is not supported"))
-            return False
-
-        backend = self._get_rgb_backend()
-        normalized_speed = self._normalize_rgb_speed(speed)
-        current_mode = self._get_saved_rgb_mode(backend)
-        mode_capabilities = self._get_rgb_mode_capabilities(backend)
-        if not mode_capabilities.get(current_mode, {}).get("speed", False):
-            decky.logger.warning(f"RGB speed is not supported for mode: {current_mode}")
-            self._debug_failure("rgb", "set_speed", "RGB speed unsupported for current mode", {"mode": current_mode, "speed": normalized_speed})
-            return False
-
-        enabled = bool(self.settings.get("rgb_enabled", False))
-        current_color = self._normalize_rgb_color(
-            self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
-        ) or RGB_COLOR_PRESETS[0]
-        current_brightness = self._get_saved_rgb_brightness()
-
-        success = True
-        if backend["type"] in {"legion_hid", "asus_hid"} and enabled:
-            success = self._write_hid_rgb(
-                backend,
-                current_color,
-                enabled,
-                current_brightness,
-                current_mode,
-                normalized_speed,
-            )
-
-        if not success:
-            self._debug_failure("rgb", "set_speed", "Failed to apply RGB speed", {"backend": backend["type"], "mode": current_mode, "speed": normalized_speed})
-            return False
-
-        self.settings["rgb_speed"] = normalized_speed
-        self._save_settings()
-        self._debug_success("rgb", "set_speed", "RGB speed applied", {"backend": backend["type"], "mode": current_mode, "speed": normalized_speed})
-        return True
+        return await self._get_rgb_controller().set_speed(speed)
 
     def _command_exists(self, cmd: str) -> bool:
         return self.runtime.resolve_command(cmd).get("available", False)
@@ -2593,29 +2080,36 @@ class Plugin:
             (THP_TMPFILES_PATH, ["madvise"]),
             (NPU_BLACKLIST_PATH, ["blacklist amdxdna"]),
             (USB_WAKE_SERVICE_PATH, ["Xbox Companion - Block USB Wake"]),
+            (USB_WAKE_SCRIPT_PATH, ["xbox-companion-usb-wake"]),
+            (USB_WAKE_CONFIG_PATH, ["# xbox-companion-usb-wake"]),
         ]
-        entries = [path for path, needles in checks if self._file_contains_all(path, needles)]
-        kernel_params = self._managed_kernel_params()
-        if kernel_params and self._file_contains_any(GRUB_DEFAULT_PATH, kernel_params):
-            entries.append(GRUB_DEFAULT_PATH)
-        return entries
+        return atomic_managed_entries(
+            checks,
+            file_contains_all=self._file_contains_all,
+            file_contains_any=self._file_contains_any,
+            grub_default_path=GRUB_DEFAULT_PATH,
+            kernel_params=self._managed_kernel_params(),
+        )
 
     def _refresh_atomic_manifest(self):
-        self._cleanup_legacy_managed_files()
-        entries = self._atomic_managed_entries()
-        if entries:
-            content = "\n".join(entries) + "\n"
-            self._write_managed_file(ATOMIC_MANIFEST_PATH, content)
-        else:
-            self._remove_file(ATOMIC_MANIFEST_PATH)
-        self._cleanup_legacy_atomic_manifests()
+        refresh_atomic_manifest(
+            manifest_path=ATOMIC_MANIFEST_PATH,
+            entries=self._atomic_managed_entries(),
+            write_managed_file=self._write_managed_file,
+            remove_file=self._remove_file,
+            cleanup_legacy_managed_files=self._cleanup_legacy_managed_files,
+            cleanup_legacy_atomic_manifests=self._cleanup_legacy_atomic_manifests,
+        )
 
     def _atomic_manifest_contains(self, paths: list[str]) -> bool:
         return self._file_contains_all(ATOMIC_MANIFEST_PATH, paths)
 
     def _migrate_atomic_manifest_if_needed(self):
-        if any(self._host_file_exists(path) for path in LEGACY_ATOMIC_PATHS):
-            self._refresh_atomic_manifest()
+        migrate_atomic_manifest_if_needed(
+            legacy_atomic_paths=LEGACY_ATOMIC_PATHS,
+            host_file_exists=self._host_file_exists,
+            refresh_atomic_manifest_fn=self._refresh_atomic_manifest,
+        )
 
     def _remove_managed_file(
         self,
@@ -2625,23 +2119,19 @@ class Plugin:
         errors: list[str],
         needles: list[str] | None = None,
         ):
-        try:
-            if not self._host_file_exists(path):
-                return
-
-            if needles and not self._file_contains_all(path, needles):
-                skipped_files.append(path)
-                return
-
-            if self._route_path_via_host(path) or needs_privilege_escalation(OPTIMIZATION_STATE_PATH):
-                success, error = self._run_command(["rm", "-f", path], use_sudo=True)
-                if not success:
-                    raise RuntimeError(error)
-            else:
-                os.remove(path)
-            removed_files.append(path)
-        except Exception as e:
-            errors.append(f"{path}: {e}")
+        remove_managed_file(
+            path=path,
+            needles=needles,
+            removed_files=removed_files,
+            skipped_files=skipped_files,
+            errors=errors,
+            host_file_exists=self._host_file_exists,
+            file_contains_all=self._file_contains_all,
+            route_path_via_host=self._route_path_via_host,
+            optimization_state_path=OPTIMIZATION_STATE_PATH,
+            needs_privilege_escalation_fn=needs_privilege_escalation,
+            run_command=self._run_command,
+        )
 
     def _run_command(self, command: list[str], use_sudo: bool = False) -> tuple[bool, str]:
         try:
@@ -2735,38 +2225,31 @@ class Plugin:
         return ""
 
     def _read_optimization_state(self) -> dict:
-        try:
-            if not self._host_file_exists(OPTIMIZATION_STATE_PATH):
-                return {}
-            data = json.loads(self._read_text_file(OPTIMIZATION_STATE_PATH, "{}"))
-            return data if isinstance(data, dict) else {}
-        except Exception as e:
-            decky.logger.warning(f"Failed to read optimization state: {e}")
-            return {}
+        return read_optimization_state(
+            optimization_state_path=OPTIMIZATION_STATE_PATH,
+            host_file_exists=self._host_file_exists,
+            read_text_file=self._read_text_file,
+            warn=decky.logger.warning,
+        )
 
     def _write_optimization_state(self, state: dict):
-        try:
-            if not state:
-                self._remove_file(OPTIMIZATION_STATE_PATH)
-                return
-            content = json.dumps(state, indent=2, sort_keys=True) + "\n"
-            directory = os.path.dirname(OPTIMIZATION_STATE_PATH)
-            if self._route_path_via_host(OPTIMIZATION_STATE_PATH) or needs_privilege_escalation(OPTIMIZATION_STATE_PATH):
-                if directory:
-                    self._run_command(["mkdir", "-p", directory], use_sudo=True)
-                self._write_file(OPTIMIZATION_STATE_PATH, content, use_sudo=True)
-                return
-            os.makedirs(directory, exist_ok=True)
-            with open(OPTIMIZATION_STATE_PATH, "w") as f:
-                f.write(content)
-        except Exception as e:
-            decky.logger.warning(f"Failed to write optimization state: {e}")
+        write_optimization_state(
+            state,
+            optimization_state_path=OPTIMIZATION_STATE_PATH,
+            route_path_via_host=self._route_path_via_host,
+            needs_privilege_escalation_fn=needs_privilege_escalation,
+            run_command=self._run_command,
+            write_file=self._write_file,
+            remove_file=self._remove_file,
+            warn=decky.logger.warning,
+        )
 
     def _pop_optimization_state_value(self, key: str):
-        state = self._read_optimization_state()
-        value = state.pop(key, None)
-        self._write_optimization_state(state)
-        return value
+        return pop_optimization_state_value(
+            key=key,
+            read_optimization_state_fn=self._read_optimization_state,
+            write_optimization_state_fn=self._write_optimization_state,
+        )
 
     def _system_write_access_available(self) -> bool:
         if os.geteuid() == 0:
@@ -2819,60 +2302,39 @@ class Plugin:
         return sorted(refresh_rates)
 
     def _systemctl(self, *args: str) -> str:
-        success, error = self._run_command(["systemctl", *args], use_sudo=True)
-        if not success:
-            decky.logger.warning(f"Optional command failed: systemctl {' '.join(args)}: {error}")
-            return error
-        return ""
+        return systemctl(*args, run_command=self._run_command, warn=decky.logger.warning)
 
     def _service_exists(self, service: str) -> bool:
-        if self._host_file_exists(f"/etc/systemd/system/{service}") or self._host_file_exists(f"/usr/lib/systemd/system/{service}"):
-            return True
-
-        try:
-            result = self.runtime.run(
-                ["systemctl", "list-unit-files", service, "--no-legend"],
-                timeout=5,
-                env=self.runtime.host_env(),
-            )
-            return result.returncode == 0 and service in result.stdout
-        except Exception:
-            return False
+        return service_exists(
+            service,
+            host_file_exists=self._host_file_exists,
+            runtime=self.runtime,
+            default_timeout=DEFAULT_COMMAND_TIMEOUT,
+        )
 
     def _service_enabled(self, service: str) -> bool:
-        try:
-            result = self.runtime.run(
-                ["systemctl", "is-enabled", service],
-                timeout=DEFAULT_COMMAND_TIMEOUT,
-                env=self.runtime.host_env(),
-            )
-            return result.returncode == 0 and result.stdout.strip() == "enabled"
-        except Exception:
-            return False
+        return service_enabled(
+            service,
+            runtime=self.runtime,
+            default_timeout=DEFAULT_COMMAND_TIMEOUT,
+        )
 
     def _service_active(self, service: str) -> bool:
-        try:
-            result = self.runtime.run(
-                ["systemctl", "is-active", service],
-                timeout=DEFAULT_COMMAND_TIMEOUT,
-                env=self.runtime.host_env(),
-            )
-            return result.returncode == 0 and result.stdout.strip() == "active"
-        except Exception:
-            return False
+        return service_active(
+            service,
+            runtime=self.runtime,
+            default_timeout=DEFAULT_COMMAND_TIMEOUT,
+        )
 
     def _read_sysctl(self, key: str) -> str:
-        result = self.runtime.run(
-            ["sysctl", "-n", key],
-            timeout=DEFAULT_COMMAND_TIMEOUT,
-            env=self.runtime.host_env(),
+        return read_sysctl(
+            key,
+            runtime=self.runtime,
+            default_timeout=DEFAULT_COMMAND_TIMEOUT,
         )
-        if result.returncode != 0:
-            return ""
-        return result.stdout.strip()
 
     def _write_sysctl(self, key: str, value: str):
-        self._run_command(["sysctl", "-w", f"{key}={value}"], use_sudo=True)
+        write_sysctl(key, value, run_command=self._run_command)
 
     def _file_contains_all(self, path: str, needles: list[str]) -> bool:
         try:
@@ -2893,173 +2355,167 @@ class Plugin:
             return False
 
     def _is_amd_platform(self) -> bool:
-        return "AMD" in self._read_file("/proc/cpuinfo", "").upper()
+        return is_amd_platform(read_file=self._read_file)
 
     def _amd_npu_present(self) -> bool:
-        if os.path.exists("/sys/module/amdxdna"):
-            return True
-
-        for device in glob.glob("/sys/bus/pci/devices/*"):
-            module_path = os.path.join(device, "driver", "module")
-            try:
-                if os.path.basename(os.path.realpath(module_path)) == "amdxdna":
-                    return True
-            except Exception:
-                continue
-
-        if self._command_exists("lspci"):
-            success, output = self._run_command_output(["lspci", "-nn"])
-            if success:
-                normalized = output.upper()
-                return "XDNA" in normalized or "NPU" in normalized or "AI ENGINE" in normalized
-
-        return False
+        return amd_npu_present(
+            command_exists=self._command_exists,
+            run_command_output=self._run_command_output,
+        )
 
     def _usb_wake_control_available(self) -> bool:
-        return os.path.exists(ACPI_WAKEUP_PATH) and self._command_exists("systemctl")
+        return usb_wake_control_available(
+            acpi_wakeup_path=ACPI_WAKEUP_PATH,
+            command_exists=self._command_exists,
+        )
+
+    def _read_acpi_wakeup_entries(self) -> list[dict]:
+        return read_acpi_wakeup_entries(acpi_wakeup_path=ACPI_WAKEUP_PATH)
 
     def _read_cmdline(self) -> str:
-        try:
-            with open("/proc/cmdline", "r") as f:
-                return f.read()
-        except Exception:
-            return ""
+        return read_cmdline()
 
     def _read_acpi_wake_enabled_devices(self) -> list[str]:
-        try:
-            with open(ACPI_WAKEUP_PATH, "r") as f:
-                devices = []
-                for line in f:
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] == "*enabled" and (parts[0].startswith("XHC") or parts[0].startswith("USB")):
-                        devices.append(parts[0])
-                return devices
-        except Exception:
-            return []
+        return read_acpi_wake_enabled_devices(acpi_wakeup_path=ACPI_WAKEUP_PATH)
+
+    def _get_usb_wake_candidate_devices(self) -> list[str]:
+        return usb_wake_candidate_devices(entries=self._read_acpi_wakeup_entries())
+
+    def _read_usb_wake_configured_devices(self) -> list[str]:
+        devices = []
+        seen = set()
+        for raw_line in self._read_text_file(USB_WAKE_CONFIG_PATH, "").splitlines():
+            device = raw_line.strip()
+            if not device or device.startswith("#"):
+                continue
+            if device in seen:
+                continue
+            seen.add(device)
+            devices.append(device)
+        return devices
+
+    def _usb_wake_service_name(self) -> str:
+        return os.path.basename(USB_WAKE_SERVICE_PATH)
+
+    def _usb_wake_service_content(self) -> str:
+        return f"""[Unit]
+Description=Xbox Companion - Block USB Wake
+ConditionPathExists={USB_WAKE_SCRIPT_PATH}
+ConditionPathExists={USB_WAKE_CONFIG_PATH}
+ConditionPathExists={ACPI_WAKEUP_PATH}
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={USB_WAKE_SCRIPT_PATH} {USB_WAKE_CONFIG_PATH} {ACPI_WAKEUP_PATH}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    def _usb_wake_script_content(self) -> str:
+        return """#!/bin/sh
+set -eu
+
+CONFIG_PATH="${1:-}"
+WAKE_PATH="${2:-}"
+
+[ -n "$CONFIG_PATH" ] || exit 0
+[ -n "$WAKE_PATH" ] || exit 0
+[ -r "$CONFIG_PATH" ] || exit 0
+[ -w "$WAKE_PATH" ] || exit 0
+
+# xbox-companion-usb-wake
+while IFS= read -r device || [ -n "$device" ]; do
+  case "$device" in
+    ""|"#"*)
+      continue
+      ;;
+  esac
+
+  if awk -v target="$device" '$1 == target && $3 == "*enabled" { found=1 } END { exit(found ? 0 : 1) }' "$WAKE_PATH"; then
+    printf '%s\n' "$device" > "$WAKE_PATH"
+  fi
+done < "$CONFIG_PATH"
+"""
+
+    def _usb_wake_config_content(self, devices: list[str]) -> str:
+        unique_devices = []
+        seen = set()
+        for device in devices:
+            normalized = str(device).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_devices.append(normalized)
+        lines = ["# xbox-companion-usb-wake", *unique_devices]
+        return "\n".join(lines) + "\n"
 
     def _set_acpi_wake_devices(self, devices: list[str]):
-        for device in devices:
-            try:
-                success, error = self._write_file(
-                    ACPI_WAKEUP_PATH,
-                    device,
-                    use_sudo=True,
-                )
-                if not success:
-                    raise RuntimeError(error)
-            except Exception as e:
-                decky.logger.warning(f"Failed to restore ACPI wake device {device}: {e}")
+        set_acpi_wake_devices(
+            devices,
+            acpi_wakeup_path=ACPI_WAKEUP_PATH,
+            write_file=self._write_file,
+            warn=decky.logger.warning,
+        )
 
     def _thp_is_madvise(self) -> bool:
-        try:
-            if not os.path.exists(THP_ENABLED_PATH):
-                return False
-            with open(THP_ENABLED_PATH, "r") as f:
-                return "[madvise]" in f.read()
-        except Exception:
-            return False
+        return thp_is_madvise(thp_enabled_path=THP_ENABLED_PATH)
 
     def _read_thp_mode(self) -> str:
-        try:
-            if not os.path.exists(THP_ENABLED_PATH):
-                return ""
-            with open(THP_ENABLED_PATH, "r") as f:
-                for token in f.read().split():
-                    if token.startswith("[") and token.endswith("]"):
-                        return token.strip("[]")
-        except Exception:
-            return ""
-        return ""
+        return read_thp_mode(thp_enabled_path=THP_ENABLED_PATH)
 
     def _write_thp_mode(self, mode: str):
-        if not mode:
-            return
-        try:
-            success, error = self._write_file(THP_ENABLED_PATH, mode, use_sudo=True)
-            if not success:
-                raise RuntimeError(error)
-        except Exception as e:
-            decky.logger.warning(f"Failed to set THP mode {mode}: {e}")
+        write_thp_mode(
+            mode,
+            thp_enabled_path=THP_ENABLED_PATH,
+            write_file=self._write_file,
+            warn=decky.logger.warning,
+        )
 
     def _kernel_param_active(self, param: str) -> bool:
-        return param in self._read_cmdline()
+        return kernel_param_active(param, read_cmdline_fn=self._read_cmdline)
 
     def _grub_param_configured(self, param: str) -> bool:
-        return self._file_contains_all(GRUB_DEFAULT_PATH, [param])
+        return grub_param_configured(
+            param,
+            grub_default_path=GRUB_DEFAULT_PATH,
+            file_contains_all=self._file_contains_all,
+        )
 
     def _managed_kernel_params(self) -> list[str]:
-        params = self._read_optimization_state().get("kernel_params", {})
-        if not isinstance(params, dict):
-            return []
         known_params = {option["param"] for option in GRUB_KERNEL_PARAM_OPTIONS.values()}
-        return [param for param in params if param in known_params]
+        return managed_kernel_params_from_state(self._read_optimization_state(), known_params)
 
     def _kernel_param_managed(self, param: str) -> bool:
         return param in self._managed_kernel_params()
 
     def _remember_kernel_param_state(self, param: str, was_configured: bool):
         state = self._read_optimization_state()
-        params = state.get("kernel_params", {})
-        if not isinstance(params, dict):
-            params = {}
-        params.setdefault(param, {"was_configured": was_configured})
-        state["kernel_params"] = params
-        self._write_optimization_state(state)
+        self._write_optimization_state(
+            remember_kernel_param_state(state, param, was_configured)
+        )
 
     def _forget_kernel_param_state(self, param: str) -> bool:
         state = self._read_optimization_state()
-        params = state.get("kernel_params", {})
-        if not isinstance(params, dict):
-            return False
-        data = params.pop(param, {})
-        if params:
-            state["kernel_params"] = params
-        else:
-            state.pop("kernel_params", None)
-        self._write_optimization_state(state)
-        return isinstance(data, dict) and data.get("was_configured", False)
+        next_state, was_configured = forget_kernel_param_state(state, param)
+        self._write_optimization_state(next_state)
+        return was_configured
 
     def _update_grub_param(self, param: str, enabled: bool) -> str:
-        if not self._host_file_exists(GRUB_DEFAULT_PATH):
-            return "GRUB config not found"
-
-        try:
-            contents = self._read_text_file(GRUB_DEFAULT_PATH, "")
-
-            lines = []
-            changed = False
-            for line in contents.splitlines():
-                if line.startswith("GRUB_CMDLINE_LINUX_DEFAULT="):
-                    prefix, value = line.split("=", 1)
-                    raw = value.strip().strip('"').strip("'")
-                    parts = [part for part in raw.split() if part != param]
-
-                    if enabled:
-                        parts.append(param)
-
-                    new_value = " ".join(parts).strip()
-                    line = f'{prefix}="{new_value}"'
-                    changed = True
-                lines.append(line)
-
-            if not changed and enabled:
-                lines.append(f'GRUB_CMDLINE_LINUX_DEFAULT="{param}"')
-
-            success, error = self._write_file(GRUB_DEFAULT_PATH, "\n".join(lines) + "\n", use_sudo=True)
-            if not success:
-                return error
-
-            self._refresh_atomic_manifest()
-
-            if self._command_exists("update-grub"):
-                success, error = self._run_command(["update-grub"], use_sudo=True)
-                if not success:
-                    decky.logger.warning(f"Optional command failed: update-grub: {error}")
-                    return error
-                return ""
-            return "update-grub is not installed"
-        except Exception as e:
-            return str(e)
+        return update_grub_param(
+            grub_default_path=GRUB_DEFAULT_PATH,
+            param=param,
+            enabled=enabled,
+            host_file_exists=self._host_file_exists,
+            read_text_file=self._read_text_file,
+            write_file=self._write_file,
+            refresh_atomic_manifest_fn=self._refresh_atomic_manifest,
+            command_exists=self._command_exists,
+            run_command=self._run_command,
+            warn=decky.logger.warning,
+        )
 
     def _optimization_state(
         self,
@@ -3073,31 +2529,17 @@ class Plugin:
         details: str = "",
         risk_note: str = "",
     ) -> dict:
-        status = "unavailable"
-        if available:
-            if needs_reboot:
-                status = "reboot-required"
-            elif enabled and active:
-                status = "active"
-            elif enabled:
-                status = "configured"
-            elif active:
-                status = "active"
-            else:
-                status = "off"
-
-        return {
-            "key": key,
-            "name": name,
-            "description": description,
-            "enabled": enabled,
-            "active": active,
-            "available": available,
-            "needs_reboot": needs_reboot,
-            "details": details,
-            "risk_note": risk_note,
-            "status": status,
-        }
+        return optimization_state(
+            key,
+            name,
+            description,
+            enabled,
+            active,
+            available,
+            needs_reboot,
+            details,
+            risk_note,
+        )
 
     def _get_lavd_state(self) -> dict:
         runtime_details = self._optimization_runtime_details()
@@ -3188,21 +2630,53 @@ class Plugin:
 
     def _get_usb_wake_state(self) -> dict:
         runtime_details = self._optimization_runtime_details()
+        service_name = self._usb_wake_service_name()
         service_configured = self._host_file_exists(USB_WAKE_SERVICE_PATH)
-        atomic = self._atomic_manifest_contains([USB_WAKE_SERVICE_PATH])
-        service_enabled = self._service_enabled("xbox-companion-disable-usb-wake.service")
-        service_active = self._service_active("xbox-companion-disable-usb-wake.service")
-        enabled = service_configured and atomic and service_enabled
+        script_configured = self._host_file_exists(USB_WAKE_SCRIPT_PATH)
+        config_configured = self._host_file_exists(USB_WAKE_CONFIG_PATH)
+        atomic = self._atomic_manifest_contains(
+            [USB_WAKE_SERVICE_PATH, USB_WAKE_SCRIPT_PATH, USB_WAKE_CONFIG_PATH]
+        )
+        legacy_service = service_configured and self._file_contains_all(
+            USB_WAKE_SERVICE_PATH,
+            ["ExecStart=/bin/sh -c", '/proc/acpi/wakeup'],
+        )
+        service_enabled = self._service_enabled(service_name)
+        service_active = self._service_active(service_name)
+        configured_devices = self._read_usb_wake_configured_devices()
+        if not configured_devices and legacy_service:
+            previous_devices = self._read_optimization_state().get("usb_wake_enabled_devices", [])
+            if isinstance(previous_devices, list):
+                configured_devices = [str(device).strip() for device in previous_devices if str(device).strip()]
+        enabled = service_configured and service_enabled and (
+            (script_configured and config_configured and atomic) or legacy_service
+        )
+        enabled_devices = set(self._read_acpi_wake_enabled_devices())
+        runtime_active = bool(configured_devices) and all(
+            device not in enabled_devices for device in configured_devices
+        )
+        candidate_devices = self._get_usb_wake_candidate_devices()
+        available = self._usb_wake_control_available() and (
+            bool(candidate_devices) or bool(configured_devices) or enabled
+        )
+        details = "Managed ACPI USB wake devices"
+        if configured_devices:
+            details += f": {', '.join(configured_devices)}"
+        else:
+            details += f": {'none detected' if not candidate_devices else ', '.join(candidate_devices)}"
+        details += " | Applies /proc/acpi/wakeup policy through a managed systemd unit"
+        if runtime_details:
+            details += f" | {runtime_details}"
 
         return self._optimization_state(
             "usb_wake",
             "USB Wake Guard",
             "Disables USB wake sources that can wake the handheld unexpectedly.",
             enabled,
-            service_active,
-            available=self._usb_wake_control_available(),
-            details="Uses /proc/acpi/wakeup through a systemd service" + (f" | {runtime_details}" if runtime_details else ""),
-            risk_note="Touches a system service.",
+            service_active and runtime_active,
+            available=available,
+            details=details,
+            risk_note="Touches ACPI wake sources and a managed systemd unit.",
         )
 
     def _get_kernel_param_state(self, key: str, option: dict) -> dict:
@@ -3243,48 +2717,62 @@ class Plugin:
 
         self._migrate_atomic_manifest_if_needed()
 
-        states = [
-            self._get_lavd_state(),
-            self._get_swap_protect_state(),
-            self._get_thp_madvise_state(),
-            self._get_npu_blacklist_state(),
-            self._get_usb_wake_state(),
-        ]
-        states.extend(
-            self._get_kernel_param_state(key, option)
-            for key, option in GRUB_KERNEL_PARAM_OPTIONS.items()
-        )
-
         return {
-            "states": states,
+            "states": [definition["state_reader"]() for definition in self._optimization_registry()],
         }
+
+    def _optimization_registry(self) -> list[dict]:
+        registry = [
+            {
+                "key": "lavd",
+                "state_reader": self._get_lavd_state,
+                "handler": self._set_lavd_enabled,
+            },
+            {
+                "key": "swap_protect",
+                "state_reader": self._get_swap_protect_state,
+                "handler": self._set_swap_protect_enabled,
+            },
+            {
+                "key": "thp_madvise",
+                "state_reader": self._get_thp_madvise_state,
+                "handler": self._set_thp_madvise_enabled,
+            },
+            {
+                "key": "npu_blacklist",
+                "state_reader": self._get_npu_blacklist_state,
+                "handler": self._set_npu_blacklist_enabled,
+            },
+            {
+                "key": "usb_wake",
+                "state_reader": self._get_usb_wake_state,
+                "handler": self._set_usb_wake_enabled,
+            },
+        ]
+        for param_key, option in GRUB_KERNEL_PARAM_OPTIONS.items():
+            registry.append(
+                {
+                    "key": param_key,
+                    "state_reader": lambda selected_key=param_key, selected_option=option: self._get_kernel_param_state(
+                        selected_key,
+                        selected_option,
+                    ),
+                    "handler": lambda value, selected=option["param"]: self._set_kernel_param_enabled(selected, value),
+                }
+            )
+        return registry
 
     def _optimization_handlers(self) -> dict:
-        handlers = {
-            "lavd": self._set_lavd_enabled,
-            "swap_protect": self._set_swap_protect_enabled,
-            "thp_madvise": self._set_thp_madvise_enabled,
-            "npu_blacklist": self._set_npu_blacklist_enabled,
-            "usb_wake": self._set_usb_wake_enabled,
+        return {
+            definition["key"]: definition["handler"]
+            for definition in self._optimization_registry()
         }
-        for param_key, option in GRUB_KERNEL_PARAM_OPTIONS.items():
-            handlers[param_key] = lambda value, selected=option["param"]: self._set_kernel_param_enabled(selected, value)
-        return handlers
 
     def _optimization_state_readers(self) -> dict:
-        states = {
-            "lavd": self._get_lavd_state,
-            "swap_protect": self._get_swap_protect_state,
-            "thp_madvise": self._get_thp_madvise_state,
-            "npu_blacklist": self._get_npu_blacklist_state,
-            "usb_wake": self._get_usb_wake_state,
+        return {
+            definition["key"]: definition["state_reader"]
+            for definition in self._optimization_registry()
         }
-        for param_key, option in GRUB_KERNEL_PARAM_OPTIONS.items():
-            states[param_key] = lambda selected_key=param_key, selected_option=option: self._get_kernel_param_state(
-                selected_key,
-                selected_option,
-            )
-        return states
 
     async def set_optimization_enabled(self, key: str, enabled: bool) -> bool:
         try:
@@ -3481,18 +2969,34 @@ class Plugin:
             decky.logger.warning("USB wake guard requires ACPI wake controls and systemctl")
             return
 
-        service_name = "xbox-companion-disable-usb-wake.service"
+        service_name = self._usb_wake_service_name()
         if enabled:
+            target_devices = self._get_usb_wake_candidate_devices()
+            if not target_devices:
+                decky.logger.warning("USB wake guard found no ACPI USB wake devices to manage")
+                return
+
             state = self._read_optimization_state()
             state.setdefault("usb_wake_enabled_devices", self._read_acpi_wake_enabled_devices())
             self._write_optimization_state(state)
-            self._write_managed_file(USB_WAKE_SERVICE_PATH, USB_WAKE_SERVICE_CONTENT)
+            self._write_managed_file(
+                USB_WAKE_CONFIG_PATH,
+                self._usb_wake_config_content(target_devices),
+            )
+            self._write_managed_file(
+                USB_WAKE_SCRIPT_PATH,
+                self._usb_wake_script_content(),
+                mode=0o755,
+            )
+            self._write_managed_file(USB_WAKE_SERVICE_PATH, self._usb_wake_service_content())
             self._refresh_atomic_manifest()
             self._systemctl("daemon-reload")
             self._systemctl("enable", "--now", service_name)
         else:
             self._systemctl("disable", "--now", service_name)
             self._remove_file(USB_WAKE_SERVICE_PATH)
+            self._remove_file(USB_WAKE_SCRIPT_PATH)
+            self._remove_file(USB_WAKE_CONFIG_PATH)
             self._refresh_atomic_manifest()
             self._systemctl("daemon-reload")
             previous_devices = self._pop_optimization_state_value("usb_wake_enabled_devices")
@@ -3519,324 +3023,48 @@ class Plugin:
         self._update_grub_param(param, False)
 
     async def get_performance_profiles(self) -> dict:
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            return {
-                "profiles": {
-                    profile_id: {**profile, "available": False}
-                    for profile_id, profile in NATIVE_PERFORMANCE_PROFILES.items()
-                },
-                "current": "",
-                "suggested_default": "",
-                "available": False,
-                "available_native": [],
-                "status": support.get("reason", "Platform is not supported"),
-            }
-
-        if self.steamos_manager is None:
-            self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
-
-        native_state = self.steamos_manager.get_performance_state()
-        available_native = native_state.get("available_native", [])
-        current = native_state.get("current") or ""
-        profiles = {}
-
-        for profile_id, profile in NATIVE_PERFORMANCE_PROFILES.items():
-            profiles[profile_id] = {
-                **profile,
-                "available": native_state.get("available", False) and profile_id in available_native
-            }
-
-        return {
-            "profiles": profiles,
-            "current": current,
-            "suggested_default": native_state.get("suggested_default", ""),
-            "available": native_state.get("available", False),
-            "available_native": available_native,
-            "status": native_state.get("status", "SteamOS native profiles unavailable")
-        }
+        return await self._get_performance_service().get_profiles()
 
     async def get_performance_modes(self) -> dict:
-        profiles_data = await self.get_performance_profiles()
-        active_native = profiles_data.get("current", "")
-        active_mode = active_native if active_native in NATIVE_PERFORMANCE_PROFILES else ""
-
-        modes = []
-        for profile_id, profile in NATIVE_PERFORMANCE_PROFILES.items():
-            native_profile = profiles_data["profiles"].get(profile_id, {})
-            modes.append({
-                "id": profile_id,
-                "label": profile["name"],
-                "native_id": profile_id,
-                "description": profile["description"],
-                "available": native_profile.get("available", False),
-                "active": active_mode == profile_id and native_profile.get("available", False),
-            })
-
-        return {
-            "modes": modes,
-            "active_mode": active_mode,
-            "native_active": active_native,
-            "available": profiles_data.get("available", False),
-            "status": profiles_data.get("status", "SteamOS native profiles unavailable"),
-        }
+        return await self._get_performance_service().get_modes()
 
     async def set_performance_profile(self, profile_id: str) -> bool:
-        try:
-            self._debug_attempt("performance", "set_profile", "Changing performance profile", {"profile_id": profile_id})
-            support = self._get_current_platform_support()
-            if not support.get("supported", False):
-                decky.logger.warning(support.get("reason", "Platform is not supported"))
-                self._debug_failure("performance", "set_profile", support.get("reason", "Platform is not supported"), {"profile_id": profile_id})
-                return False
-
-            if profile_id not in NATIVE_PERFORMANCE_PROFILES:
-                decky.logger.error(f"Unknown profile: {profile_id}")
-                self._debug_failure("performance", "set_profile", "Unknown profile", {"profile_id": profile_id})
-                return False
-
-            if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
-
-            native_state = self.steamos_manager.get_performance_state()
-            if not native_state.get("available", False):
-                decky.logger.warning(native_state.get("status", "SteamOS native profiles unavailable"))
-                self._debug_failure("performance", "set_profile", native_state.get("status", "SteamOS native profiles unavailable"), {"profile_id": profile_id, "state": native_state})
-                return False
-
-            if profile_id not in native_state.get("available_native", []):
-                decky.logger.warning(f"SteamOS performance profile is not available: {profile_id}")
-                self._debug_failure("performance", "set_profile", "Requested profile unavailable", {"profile_id": profile_id, "available_native": native_state.get("available_native", [])})
-                return False
-
-            success, error = self.steamos_manager.set_performance_profile(profile_id)
-            if not success:
-                decky.logger.error(f"Failed to set SteamOS performance profile: {error}")
-                self._debug_failure("performance", "set_profile", f"Failed to set SteamOS performance profile: {error}", {"profile_id": profile_id})
-                return False
-            
-            profile_name = NATIVE_PERFORMANCE_PROFILES[profile_id]["name"]
-            decky.logger.info(f"Applied SteamOS performance profile: {profile_name} ({profile_id})")
-            self._debug_success("performance", "set_profile", "Performance profile applied", {"profile_id": profile_id, "profile_name": profile_name})
-            return True
-            
-        except Exception as e:
-            decky.logger.error(f"Failed to set performance profile: {e}")
-            self._debug_failure("performance", "set_profile", f"Failed to set performance profile: {e}", {"profile_id": profile_id})
-            return False
+        return await self._get_performance_service().set_profile(profile_id)
 
     async def get_display_sync_state(self) -> dict:
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            reason = support.get("reason", "Platform is not supported")
-            return {
-                "backend": "platform-guard",
-                "display": "",
-                "vrr": {
-                    "available": False,
-                    "capable": False,
-                    "enabled": False,
-                    "active": False,
-                    "status": reason,
-                    "details": reason,
-                },
-                "vsync": {
-                    "available": False,
-                    "enabled": False,
-                    "allow_tearing": False,
-                    "status": reason,
-                    "details": reason,
-                },
-            }
-
-        if self.gamescope_settings is None:
-            self.gamescope_settings = GamescopeSettingsClient(decky.logger, self.runtime)
-
-        return self.gamescope_settings.get_display_sync_state()
+        return await self._get_display_service().get_sync_state()
 
     async def set_display_sync_setting(self, key: str, enabled: bool) -> bool:
-        try:
-            self._debug_attempt("display", "set_sync", "Changing display sync setting", {"key": key, "enabled": enabled})
-            support = self._get_current_platform_support()
-            if not support.get("supported", False):
-                decky.logger.warning(support.get("reason", "Platform is not supported"))
-                self._debug_failure("display", "set_sync", support.get("reason", "Platform is not supported"), {"key": key, "enabled": enabled})
-                return False
-
-            if self.gamescope_settings is None:
-                self.gamescope_settings = GamescopeSettingsClient(decky.logger, self.runtime)
-
-            if key == "vrr":
-                success, error = self.gamescope_settings.set_vrr_enabled(enabled)
-            elif key == "vsync":
-                success, error = self.gamescope_settings.set_vsync_enabled(enabled)
-            else:
-                decky.logger.error(f"Unknown display sync setting: {key}")
-                self._debug_failure("display", "set_sync", "Unknown display sync setting", {"key": key, "enabled": enabled})
-                return False
-
-            if not success:
-                decky.logger.warning(f"Failed to set display sync setting {key}: {error}")
-                self._debug_failure("display", "set_sync", f"Failed to set display sync setting: {error}", {"key": key, "enabled": enabled})
-                return False
-
-            decky.logger.info(
-                f"Set display sync setting {key} to {'enabled' if enabled else 'disabled'}"
-            )
-            self._debug_success("display", "set_sync", "Display sync setting updated", {"key": key, "enabled": enabled})
-            return True
-        except Exception as e:
-            decky.logger.error(f"Failed to set display sync setting {key}: {e}")
-            self._debug_failure("display", "set_sync", f"Failed to set display sync setting: {e}", {"key": key, "enabled": enabled})
-            return False
+        return await self._get_display_service().set_sync_setting(key, enabled)
 
     async def get_fps_limit_state(self) -> dict:
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            return {
-                "available": False,
-                "current": 0,
-                "requested": 0,
-                "is_live": False,
-                "presets": self._get_fps_presets(),
-                "status": support.get("reason", "Platform is not supported"),
-                "details": support.get("reason", "Platform is not supported"),
-            }
-
-        if self.gamescope_settings is None:
-            self.gamescope_settings = GamescopeSettingsClient(decky.logger, self.runtime)
-
-        gamescopectl_info = self._command_info("gamescopectl")
-        available = gamescopectl_info.get("available", False)
-        live_value = None
-        gamescopectl_error = ""
-        xprop_error = ""
-
-        if available:
-            for command in (
-                ["gamescopectl", "debug_get_fps_limit"],
-                ["gamescopectl", "get_fps_limit"],
-            ):
-                success, output = self._run_command_output(command)
-                if not success:
-                    gamescopectl_error = output
-                    continue
-                tokens = [token for token in shlex.split(output) if token.strip()]
-                integers = []
-                for token in tokens:
-                    try:
-                        integers.append(int(token, 0))
-                    except ValueError:
-                        continue
-                if integers:
-                    live_value = integers[-1]
-                    break
-            if live_value is None:
-                ok, atom_value, xprop_error, _atom = self.gamescope_settings.get_fps_limit_state()
-                if ok:
-                    live_value = atom_value
-
-        if live_value is None:
-            ok, atom_value, xprop_error, _atom = self.gamescope_settings.get_fps_limit_state()
-            if ok:
-                live_value = atom_value
-                available = True
-
-        current = 0 if live_value is None else live_value
-        available_for_ui = live_value is not None
-        if live_value is not None:
-            status = "available"
-            details = "Uses live gamescope framerate control"
-        elif available and gamescopectl_error:
-            status = f"gamescopectl unavailable at runtime: {gamescopectl_error}"
-            details = gamescopectl_error
-        elif xprop_error:
-            status = f"gamescope fps properties unavailable: {xprop_error}"
-            details = xprop_error
-        else:
-            status = "gamescopectl or gamescope fps properties are unavailable"
-            details = "Live framerate control is unavailable on this system"
-
-        return {
-            "available": available_for_ui,
-            "current": current,
-            "requested": current,
-            "is_live": live_value is not None,
-            "presets": self._get_fps_presets(),
-            "status": status,
-            "details": details,
-        }
+        return await self._get_display_service().get_fps_limit_state()
 
     async def set_fps_limit(self, value: int) -> bool:
-        self._debug_attempt("display", "set_fps_limit", "Changing framerate limit", {"value": value})
-        support = self._get_current_platform_support()
-        if not support.get("supported", False):
-            decky.logger.warning(support.get("reason", "Platform is not supported"))
-            self._debug_failure("display", "set_fps_limit", support.get("reason", "Platform is not supported"), {"value": value})
-            return False
-
-        value = max(0, int(value))
-        if not self._command_exists("gamescopectl"):
-            decky.logger.warning("gamescopectl is not installed")
-            self._debug_failure("display", "set_fps_limit", "gamescopectl is not installed", {"value": value})
-            return False
-
-        if value not in self._get_fps_presets():
-            decky.logger.warning(f"Unsupported framerate preset: {value}")
-            self._debug_failure("display", "set_fps_limit", "Unsupported framerate preset", {"value": value, "supported": self._get_fps_presets()})
-            return False
-
-        success = False
-        error = "Failed to set framerate limit"
-        for command in (
-            ["gamescopectl", "debug_set_fps_limit", str(value)],
-            ["gamescopectl", "set_fps_limit", str(value)],
-        ):
-            success, error = self._run_command(command)
-            if success:
-                break
-        if not success:
-            decky.logger.error(f"Failed to set framerate limit: {error}")
-            self._debug_failure("display", "set_fps_limit", f"Failed to set framerate limit: {error}", {"value": value})
-            return False
-
-        decky.logger.info(
-            "Applied gamescope framerate limit: unlimited"
-            if value == 0
-            else f"Applied gamescope framerate limit: {value}"
-        )
-        self._debug_success("display", "set_fps_limit", "Framerate limit updated", {"value": value})
-        return True
+        return await self._get_display_service().set_fps_limit(value)
 
     async def get_charge_limit_state(self) -> dict:
         support = self._get_current_platform_support()
         if not support.get("supported", False):
-            return {
-                "available": False,
-                "enabled": False,
-                "limit": STEAMOS_CHARGE_FULL_PERCENT,
-                "status": support.get("reason", "Platform is not supported"),
-                "details": support.get("reason", "Platform is not supported"),
-            }
+            return self._unsupported_platform_state(
+                {
+                    "available": False,
+                    "enabled": False,
+                    "limit": STEAMOS_CHARGE_FULL_PERCENT,
+                },
+                support,
+            )
 
-        if self.steamos_manager is None:
-            self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
-
-        return self.steamos_manager.get_charge_limit_state()
+        return self._get_steamos_manager().get_charge_limit_state()
 
     async def set_charge_limit_enabled(self, enabled: bool) -> bool:
         try:
             self._debug_attempt("power", "set_charge_limit", "Changing battery charge limit", {"enabled": enabled})
-            support = self._get_current_platform_support()
-            if not support.get("supported", False):
-                decky.logger.warning(support.get("reason", "Platform is not supported"))
-                self._debug_failure("power", "set_charge_limit", support.get("reason", "Platform is not supported"), {"enabled": enabled})
+            ok, _support = self._guard_supported_action("power", "set_charge_limit", {"enabled": enabled})
+            if not ok:
                 return False
 
-            if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
-
-            success, error = self.steamos_manager.set_charge_limit_enabled(enabled)
+            success, error = self._get_steamos_manager().set_charge_limit_enabled(enabled)
             if not success:
                 decky.logger.warning(f"Failed to set SteamOS charge limit: {error}")
                 self._debug_failure("power", "set_charge_limit", f"Failed to set SteamOS charge limit: {error}", {"enabled": enabled})
@@ -3855,17 +3083,15 @@ class Plugin:
     async def get_smt_state(self) -> dict:
         support = self._get_current_platform_support()
         if not support.get("supported", False):
-            return {
-                "available": False,
-                "enabled": False,
-                "status": support.get("reason", "Platform is not supported"),
-                "details": support.get("reason", "Platform is not supported"),
-            }
+            return self._unsupported_platform_state(
+                {
+                    "available": False,
+                    "enabled": False,
+                },
+                support,
+            )
 
-        if self.steamos_manager is None:
-            self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
-
-        steamos_state = self.steamos_manager.get_smt_state()
+        steamos_state = self._get_steamos_manager().get_smt_state()
         if steamos_state.get("available", False):
             return steamos_state
 
@@ -3892,18 +3118,13 @@ class Plugin:
     async def set_smt_enabled(self, enabled: bool) -> bool:
         try:
             self._debug_attempt("cpu", "set_smt", "Changing SMT state", {"enabled": enabled})
-            support = self._get_current_platform_support()
-            if not support.get("supported", False):
-                decky.logger.warning(support.get("reason", "Platform is not supported"))
-                self._debug_failure("cpu", "set_smt", support.get("reason", "Platform is not supported"), {"enabled": enabled})
+            ok, _support = self._guard_supported_action("cpu", "set_smt", {"enabled": enabled})
+            if not ok:
                 return False
 
-            if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
-
-            steamos_state = self.steamos_manager.get_smt_state()
+            steamos_state = self._get_steamos_manager().get_smt_state()
             if steamos_state.get("available", False):
-                success, error = self.steamos_manager.set_smt_enabled(enabled)
+                success, error = self._get_steamos_manager().set_smt_enabled(enabled)
                 if not success:
                     decky.logger.warning(f"Failed to set SteamOS SMT: {error}")
                     self._debug_failure("cpu", "set_smt", f"Failed to set SteamOS SMT: {error}", {"enabled": enabled})
@@ -3991,13 +3212,15 @@ class Plugin:
         """Get current SMT and CPU boost settings"""
         support = self._get_current_platform_support()
         if not support.get("supported", False):
-            return {
-                "smt_enabled": False,
-                "smt_available": False,
-                "boost_enabled": False,
-                "boost_available": False,
-                "status": support.get("reason", "Platform is not supported"),
-            }
+            return self._unsupported_platform_state(
+                {
+                    "smt_enabled": False,
+                    "smt_available": False,
+                    "boost_enabled": False,
+                    "boost_available": False,
+                },
+                support,
+            )
 
         smt = await self.get_smt_state()
         result = {
@@ -4010,10 +3233,7 @@ class Plugin:
         }
 
         try:
-            if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
-
-            boost_state = self.steamos_manager.get_cpu_boost_state()
+            boost_state = self._get_steamos_manager().get_cpu_boost_state()
             if boost_state.get("available", False):
                 result["boost_available"] = True
                 result["boost_enabled"] = boost_state.get("enabled", False)
@@ -4033,18 +3253,13 @@ class Plugin:
         """Enable or disable CPU boost"""
         try:
             self._debug_attempt("cpu", "set_boost", "Changing CPU boost state", {"enabled": enabled})
-            support = self._get_current_platform_support()
-            if not support.get("supported", False):
-                decky.logger.warning(support.get("reason", "Platform is not supported"))
-                self._debug_failure("cpu", "set_boost", support.get("reason", "Platform is not supported"), {"enabled": enabled})
+            ok, _support = self._guard_supported_action("cpu", "set_boost", {"enabled": enabled})
+            if not ok:
                 return False
 
-            if self.steamos_manager is None:
-                self.steamos_manager = SteamOsManagerClient(decky.logger, self.runtime)
-
-            native_state = self.steamos_manager.get_cpu_boost_state()
+            native_state = self._get_steamos_manager().get_cpu_boost_state()
             if native_state.get("available", False):
-                success, error = self.steamos_manager.set_cpu_boost_enabled(enabled)
+                success, error = self._get_steamos_manager().set_cpu_boost_enabled(enabled)
                 if not success:
                     decky.logger.warning(f"Failed to set SteamOS CPU boost: {error}")
                     self._debug_failure("cpu", "set_boost", f"Failed to set SteamOS CPU boost: {error}", {"enabled": enabled})
@@ -4084,114 +3299,7 @@ class Plugin:
         return runtime_state
 
     async def get_dashboard_state(self) -> dict:
-        performance_modes = await self.get_performance_modes()
-        cpu = await self.get_cpu_settings()
-        rgb = await self.get_rgb_state()
-        sync = await self.get_display_sync_state()
-        fps_limit = await self.get_fps_limit_state()
-        charge_limit = await self.get_charge_limit_state()
-
-        return {
-            "performance_modes": performance_modes.get("modes", []),
-            "active_mode": performance_modes.get("active_mode", ""),
-            "profiles_available": performance_modes.get("available", False),
-            "profiles_status": performance_modes.get("status", ""),
-            "cpu_boost": {
-                "available": cpu.get("boost_available", False),
-                "enabled": cpu.get("boost_enabled", False),
-                "status": "available" if cpu.get("boost_available", False) else "CPU boost control unavailable",
-                "details": (
-                    "Boosts CPU clocks for heavier games"
-                    if cpu.get("boost_available", False)
-                    else cpu.get("status", "CPU boost control unavailable")
-                ),
-            },
-            "smt": {
-                "available": cpu.get("smt_available", False),
-                "enabled": cpu.get("smt_enabled", False),
-                "status": "available" if cpu.get("smt_available", False) else "SMT control unavailable",
-                "details": (
-                    cpu.get("smt_details")
-                    if cpu.get("smt_available", False)
-                    else cpu.get("smt_status", "SMT control unavailable")
-                ),
-            },
-            "rgb": rgb,
-            "vrr": sync.get("vrr", {}),
-            "vsync": sync.get("vsync", {}),
-            "fps_limit": fps_limit,
-            "charge_limit": charge_limit,
-        }
+        return await self._get_state_aggregator().get_dashboard_state()
 
     async def get_information_state(self) -> dict:
-        device = await self.get_device_info()
-        battery = await self.get_battery_info()
-        profiles = await self.get_performance_profiles()
-        sync = await self.get_display_sync_state()
-        temps = await self.get_current_tdp()
-        cpu = await self.get_cpu_settings()
-        rgb = await self.get_rgb_state()
-        optimizations = await self.get_optimization_states()
-        fps_limit = await self.get_fps_limit_state()
-        charge_limit = await self.get_charge_limit_state()
-        platform_supported = device.get("platform_supported", device.get("supported", False))
-
-        hardware_controls = {
-            "performance_profiles": platform_supported and profiles.get("available", False),
-            "cpu_boost": platform_supported and cpu.get("boost_available", False),
-            "smt": platform_supported and cpu.get("smt_available", False),
-            "charge_limit": platform_supported and charge_limit.get("available", False),
-            "rgb": platform_supported and rgb.get("available", False),
-            "vrr": platform_supported and sync.get("vrr", {}).get("available", False),
-            "vsync": platform_supported and sync.get("vsync", {}).get("available", False),
-            "fps_limit": platform_supported and fps_limit.get("available", False),
-            "optimizations": platform_supported and any(
-                state.get("available", False)
-                for state in optimizations.get("states", [])
-            ),
-        }
-
-        snapshot = {
-            "runtime_backend": self.runtime.execution_backend(),
-            "performance_status": profiles.get("status", ""),
-            "performance_current": profiles.get("current", ""),
-            "cpu_boost_available": cpu.get("boost_available", False),
-            "cpu_boost_enabled": cpu.get("boost_enabled", False),
-            "smt_available": cpu.get("smt_available", False),
-            "smt_enabled": cpu.get("smt_enabled", False),
-            "vrr_available": sync.get("vrr", {}).get("available", False),
-            "vrr_enabled": sync.get("vrr", {}).get("enabled", False),
-            "vsync_available": sync.get("vsync", {}).get("available", False),
-            "vsync_enabled": sync.get("vsync", {}).get("enabled", False),
-            "fps_available": fps_limit.get("available", False),
-            "fps_current": fps_limit.get("current", 0),
-            "charge_limit_available": charge_limit.get("available", False),
-            "charge_limit_enabled": charge_limit.get("enabled", False),
-            "rgb_available": rgb.get("available", False),
-            "rgb_mode": rgb.get("mode", ""),
-            "rgb_enabled": rgb.get("enabled", False),
-            "optimizations_available": [state.get("key") for state in optimizations.get("states", []) if state.get("available", False)],
-        }
-        self._debug_event("information", "refresh", "snapshot", "Information view refreshed", snapshot)
-
-        return {
-            "device": device,
-            "battery": battery,
-            "performance": {
-                "current_profile": profiles.get("current", ""),
-                "available_native": profiles.get("available_native", []),
-                "status": profiles.get("status", ""),
-            },
-            "display": sync,
-            "temperatures": {
-                "tdp": temps.get("tdp", 0),
-                "cpu": temps.get("cpu_temp", 0),
-                "gpu": temps.get("gpu_temp", 0),
-                "gpu_clock": temps.get("gpu_clock", 0),
-            },
-            "optimizations": optimizations.get("states", []),
-            "hardware_controls": hardware_controls,
-            "fps_limit": fps_limit,
-            "runtime": self._get_runtime_state(),
-            "debug_log": list(self.debug_log),
-        }
+        return await self._get_state_aggregator().get_information_state()
